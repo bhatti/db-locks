@@ -1,0 +1,29 @@
+[package]
+name = "db-locks"
+version = "0.1.0"
+authors = ["bhatti"]
+edition = "2021"
+
+[dependencies]
+rand = "0.8.4"
+uuid = { version = "1.1.2", features = ["v4", "fast-rng", "macro-diagnostics"] }
+futures = "0.3.24"
+tokio = { version = "1", features = ["full"] }
+
+prometheus = "0.13.2"
+diesel = { version = "2.0.0", features = ["postgres", "sqlite", "chrono", "serde_json", "r2d2"] }
+diesel_migrations = "2.0.0"
+r2d2 = "*"
+r2d2-diesel = "*"
+dotenv = "0.15"
+env_logger = "0.9"
+log = "0.4"
+
+aws-config = { git = "https://github.com/awslabs/aws-sdk-rust", branch = "main" }
+aws-sdk-dynamodb = { git = "https://github.com/awslabs/aws-sdk-rust", branch = "main" }
+
+# Data serialization library
+serde = { version = "1.0.110", features = ["derive"] }
+# Other utilities
+chrono = { version = "0.4.11", features = ["serde"] }
+
