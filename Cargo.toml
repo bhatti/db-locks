@@ -1,6 +1,6 @@
 [package]
 name = "db-locks"
-version = "0.1.0"
+version = "0.1.2"
 authors = ["bhatti"]
 edition = "2021"
 
@@ -26,4 +26,10 @@ aws-sdk-dynamodb = { git = "https://github.com/awslabs/aws-sdk-rust", branch = "
 serde = { version = "1.0.110", features = ["derive"] }
 # Other utilities
 chrono = { version = "0.4.11", features = ["serde"] }
+serde_json = "1.0"
+async-trait = "0.1.57"
+async-recursion = "1.0.0"
+cfg-if = "1.0.0"
+clap = { version = "4.0.8", features = ["derive"] }
 
+[dev-dependencies]

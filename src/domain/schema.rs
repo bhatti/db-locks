@@ -1,21 +1,15 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
-    lock_items (key) {
-        key -> Text,
-        version -> Nullable<Text>,
+    mutexes (mutex_key, tenant_id) {
+        mutex_key -> Text,
+        tenant_id -> Text,
+        version -> Text,
+        lease_duration_ms -> BigInt,
         semaphore_key -> Nullable<Text>,
         data -> Nullable<Text>,
-        replace_data -> Nullable<Bool>,
         delete_on_release -> Nullable<Bool>,
-        owner -> Nullable<Text>,
         locked -> Nullable<Bool>,
-        lease_duration_ms -> BigInt,
-        reentrant -> Nullable<Bool>,
-        acquire_only_if_already_exists -> Nullable<Bool>,
-        refresh_period_ms -> Nullable<BigInt>,
-        additional_time_to_wait_for_lock_ms -> Nullable<BigInt>,
-        override_time_to_wait_for_lock_ms -> Nullable<BigInt>,
         expires_at -> Nullable<Timestamp>,
         created_by -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
@@ -25,18 +19,13 @@ diesel::table! {
 }
 
 diesel::table! {
-    semaphores (key) {
-        key -> Text,
-        version -> Nullable<Text>,
-        data -> Nullable<Text>,
-        replace_data -> Nullable<Bool>,
-        delete_on_release -> Nullable<Bool>,
-        owner -> Nullable<Text>,
+    semaphores (semaphore_key, tenant_id) {
+        semaphore_key -> Text,
+        tenant_id -> Text,
+        version -> Text,
         max_size -> Integer,
         lease_duration_ms -> BigInt,
-        reentrant -> Nullable<Bool>,
-        refresh_period_ms -> Nullable<BigInt>,
-        additional_time_to_wait_for_lock_ms -> Nullable<BigInt>,
+        data -> Nullable<Text>,
         created_by -> Nullable<Text>,
         created_at -> Nullable<Timestamp>,
         updated_by -> Nullable<Text>,
@@ -45,6 +34,6 @@ diesel::table! {
 }
 
 diesel::allow_tables_to_appear_in_same_query!(
-    lock_items,
+    mutexes,
     semaphores,
 );
