@@ -21,6 +21,7 @@ log = "0.4"
 
 aws-config = { git = "https://github.com/awslabs/aws-sdk-rust", branch = "main" }
 aws-sdk-dynamodb = { git = "https://github.com/awslabs/aws-sdk-rust", branch = "main" }
+redis = { version = "0.21.5", features = ["tokio-native-tls-comp", "cluster"] }
 
 # Data serialization library
 serde = { version = "1.0.110", features = ["derive"] }
@@ -31,5 +32,8 @@ async-trait = "0.1.57"
 async-recursion = "1.0.0"
 cfg-if = "1.0.0"
 clap = { version = "4.0.8", features = ["derive"] }
+serde_yaml = "0.9.13"
+gethostname = "0.2.3"
+lazy_static = "1.4.0"
 
 [dev-dependencies]

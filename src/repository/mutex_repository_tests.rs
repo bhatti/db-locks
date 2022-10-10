@@ -1,16 +1,18 @@
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::env;
     use std::sync::Arc;
     use std::time::Duration;
 
     use async_recursion::async_recursion;
+    use env_logger::Env;
     use futures::future::join_all;
     use tokio::time::Instant;
     use uuid::Uuid;
+    use crate::domain::models;
 
-    use crate::domain::models::{AcquireLockOptionsBuilder, LocksConfig, MutexLock, RepositoryProvider};
+    use crate::domain::models::{LocksConfig, MutexLock, RepositoryProvider, SemaphoreBuilder};
+    use crate::domain::options::AcquireLockOptionsBuilder;
     use crate::repository;
     use crate::repository::MutexRepository;
     use crate::repository::factory;
@@ -30,31 +32,29 @@ mod tests {
         for mutex_repo in build_test_mutex_repos(true).await {
             let key = Uuid::new_v4().to_string();
             for i in 0..3 {
-                let lock = build_lock(key.as_str(), i);
+                let mutex = build_mutex(key.as_str(), i);
                 if i < 2 {
                     // WHEN creating a new lock with a new key and tenant-id
                     // THEN it should succeed
-                    mutex_repo.create(&lock).await
-                        .expect(format!("should create lock i {} - lock {}, provider {}",
-                                        i, lock, mutex_repo.provider).as_str());
+                    mutex_repo.create(&mutex).await
+                        .expect("should create lock");
                 } else {
                     // WHEN creating a lock with existing key and tenant-id
                     // THEN it should fail
-                    assert_eq!(true, mutex_repo.create(&lock).await.is_err());
+                    assert!(mutex_repo.create(&mutex).await.is_err());
 
-                    let old_version = versions.get(&lock.full_key()).unwrap().clone();
+                    let old_version = versions.get(&mutex.full_key()).unwrap().clone();
                     // WHEN acquiring lock with existing key and tenant-id
                     // THEN it should succeed
-                    mutex_repo.acquire_update(old_version.as_str(), &lock).await
-                        .expect(format!("should acquire lock i {} - lock {}, provider {}",
-                                        i, lock, mutex_repo.provider).as_str());
+                    mutex_repo.acquire_update(old_version.as_str(), &mutex).await
+                        .expect("should acquire lock");
                 }
 
                 // WHEN finding lock with existing key and tenant-id
                 // THEN it should succeed
-                assert_eq!(lock, mutex_repo.get(lock.mutex_key.as_str(), lock.tenant_id.as_str()).await.unwrap());
+                assert_eq!(mutex, mutex_repo.get(mutex.mutex_key.as_str(), mutex.tenant_id.as_str()).await.unwrap());
 
-                versions.insert(lock.full_key(), lock.version);
+                versions.insert(mutex.full_key(), mutex.version);
             }
 
             // Note: Though we are writing 5 times but unique keys are only mutex_key and tenant_id so we will only
@@ -82,23 +82,22 @@ mod tests {
         // GIVEN mutex repository
         for mutex_repo in build_test_mutex_repos(true).await {
             for i in 0..3 {
-                let lock = build_lock(&key, i);
+                let lock = build_mutex(&key, i);
                 if i < 2 {
                     // WHEN creating a new lock with a new key and tenant-id
                     // THEN it should succeed
-                    mutex_repo.create(&lock).await.expect(format!("should create lock i {} - lock {}, provider {}",
-                                                                  i, lock, mutex_repo.provider).as_str());
+                    mutex_repo.create(&lock)
+                        .await.expect("should create lock");
                 } else {
                     // WHEN creating a lock with existing key and tenant-id
                     // THEN it should fail
-                    assert_eq!(true, mutex_repo.create(&lock).await.is_err());
+                    assert!(mutex_repo.create(&lock).await.is_err());
 
                     let old_version = versions.get(&lock.full_key()).unwrap().clone();
                     // WHEN acquiring lock with existing key and tenant-id
                     // THEN it should succeed
                     mutex_repo.acquire_update(old_version.as_str(), &lock).await
-                        .expect(format!("should acquire lock i {} - lock {}, provider {}",
-                                        i, lock, mutex_repo.provider).as_str());
+                        .expect("should acquire lock");
                 }
                 versions.insert(lock.full_key(), lock.version);
             }
@@ -117,7 +116,7 @@ mod tests {
 
             // WHEN finding lock with deleted key and tenant-id
             // THEN it should fail
-            assert_eq!(true, mutex_repo.get(key.as_str(), "tenant_id_100").await.is_err());
+            assert!(mutex_repo.get(key.as_str(), "tenant_id_100").await.is_err());
 
             // WHEN finding lock with existing key and tenant-id
             // THEN it should succeed
@@ -134,7 +133,7 @@ mod tests {
 
             // WHEN finding lock with deleted key and tenant-id
             // THEN it should fail
-            assert_eq!(true, mutex_repo.get(key.as_str(), "tenant_id_200").await.is_err());
+            assert!(mutex_repo.get(key.as_str(), "tenant_id_200").await.is_err());
         }
     }
 
@@ -144,12 +143,11 @@ mod tests {
         for mutex_repo in build_test_mutex_repos(true).await {
             let key = Uuid::new_v4().to_string();
             for i in 0..2 {
-                let lock = build_lock(&key, i);
+                let lock = build_mutex(&key, i);
                 // WHEN creating a new lock with a new key and tenant-id
                 // THEN it should succeed
                 assert_eq!(1, mutex_repo.create(&lock).await
-                    .expect(format!("should create lock i {} - lock {}, provider {}",
-                                    i, lock, mutex_repo.provider).as_str()));
+                    .expect("should create lock"));
 
                 // WHEN finding lock with existing key and tenant-id
                 // THEN it should succeed
@@ -195,11 +193,11 @@ mod tests {
         // GIVEN mutex repository
         for mutex_repo in build_test_mutex_repos(true).await {
             let key = Uuid::new_v4().to_string();
-            let mut lock = build_lock(&key, 1);
+            let mut lock = build_mutex(&key, 1);
             // WHEN creating a new lock with a new key and tenant-id
             // THEN it should succeed
-            assert_eq!(1, mutex_repo.create(&lock).await.expect(format!("should create lock {}, provider {}",
-                                                                        lock, mutex_repo.provider).as_str()));
+            assert_eq!(1, mutex_repo.create(&lock)
+                .await.expect("should create lock"));
 
             // updating version
             let old_version = lock.version.clone();
@@ -212,7 +210,7 @@ mod tests {
 
             // WHEN deleting mutex that is locked
             // THEN it should fail
-            assert_eq!(true, mutex_repo.delete_expired_lock(
+            assert!(mutex_repo.delete_expired_lock(
                 key.as_str(), lock.tenant_id.as_str()).await.is_err());
 
             // WHEN releasing lock with existing key and tenant-id
@@ -230,20 +228,22 @@ mod tests {
     #[tokio::test]
     async fn test_should_paginate_query_by_semaphore_key() {
         // GIVEN mutex repository, tenant-id and semaphore-id
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         for mutex_repo in build_test_mutex_repos(true).await {
             // GIVEN initialize data with test data
-            let sem_key = format!("SEMAPHORE_{}", Uuid::new_v4().to_string());
-            for i in 0..500 {
-                let key = Uuid::new_v4().to_string();
-                let mut lock = build_lock(&key, i);
-                lock.tenant_id = tenant_id.clone();
-                lock.semaphore_key = Some(sem_key.clone());
-                lock.data = Some(format!("{}", i));
+            let sem_key = format!("SEMAPHORE_{}", Uuid::new_v4());
+            let semaphore = SemaphoreBuilder::new(sem_key.as_str(), 500)
+                .with_lease_duration_secs(5).build();
+            let mutexes = semaphore.generate_mutexes(0);
+            for (i, mutex) in mutexes.iter().enumerate() {
+                let mut mutex = mutex.locked_clone();
+                mutex.tenant_id = tenant_id.clone();
+                mutex.semaphore_key = Some(sem_key.clone());
+                mutex.data = Some(format!("{}", i));
                 // WHEN creating a new lock with a new key and tenant-id
                 // THEN it should succeed
-                assert_eq!(1, mutex_repo.create(&lock).await.expect(format!("should create lock i {} - lock {}, provider {}",
-                                                                            i, lock, mutex_repo.provider).as_str()));
+                assert_eq!(1, mutex_repo.create(&mutex)
+                    .await.expect("should create lock"));
             }
             let mut next_page: Option<String> = None;
             let mut data_map = HashMap::new();
@@ -254,8 +254,7 @@ mod tests {
                 // WHEN finding mutexes by tenant-id
                 let res = mutex_repo.find_by_semaphore(
                     sem_key.as_str(), tenant_id.as_str(), next_page.as_deref(), 100)
-                    .await.expect(format!("failed to find by semaphore-key i {} next {:?}, tenant {:?}, semaphore {:?}",
-                                          i, next_page, tenant_id, sem_key).as_str());
+                    .await.expect("failed to find by semaphore-key");
                 for (_j, lock) in res.records.iter().enumerate() {
                     data_map.insert(lock.data.clone().unwrap(), true);
                 }
@@ -263,11 +262,11 @@ mod tests {
                 if i == 5 {
                     assert_eq!(0, res.records.len(), "unexpected result for page {} - {}", i, res.records.len());
                 } else {
-                    assert_eq!(100, res.records.len());
+                    assert!(res.records.len() >= 90 && res.records.len() <= 105); // redis doesn't return exact count
                 }
                 next_page = res.next_page.clone();
             }
-            assert_eq!(None, next_page);
+            assert!(next_page == None || next_page == Some("-1".to_string()));
             assert_eq!(500, data_map.len());
         }
     }
@@ -275,18 +274,18 @@ mod tests {
     #[tokio::test]
     async fn test_should_paginate_query_by_tenant() {
         // GIVEN mutex repository and tenant-id
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         for mutex_repo in build_test_mutex_repos(true).await {
             // GIVEN initialize data with test data
             for i in 0..500 {
                 let key = Uuid::new_v4().to_string();
-                let mut lock = build_lock(&key, i);
+                let mut lock = build_mutex(&key, i);
                 lock.tenant_id = tenant_id.clone();
                 lock.data = Some(format!("{}", i));
                 // WHEN creating a new lock with a new key and tenant-id
                 // THEN it should succeed
-                assert_eq!(1, mutex_repo.create(&lock).await.expect(format!("should create lock i {} - lock {}, provider {}",
-                                                                            i, lock, mutex_repo.provider).as_str()));
+                assert_eq!(1, mutex_repo.create(&lock)
+                    .await.expect("should create lock"));
             }
             let mut next_page: Option<String> = None;
             let mut data_map = HashMap::new();
@@ -304,11 +303,11 @@ mod tests {
                 if i == 5 {
                     assert_eq!(0, res.records.len(), "unexpected result for page {} - {}", i, res.records.len());
                 } else {
-                    assert_eq!(100, res.records.len());
+                    assert!(res.records.len() >= 90 && res.records.len() <= 105); // redis doesn't return exact count
                 }
                 next_page = res.next_page.clone();
             }
-            assert_eq!(None, next_page);
+            assert!(next_page == None || next_page == Some("-1".to_string()));
             assert_eq!(500, data_map.len());
         }
     }
@@ -319,11 +318,11 @@ mod tests {
         for mutex_repo in build_test_mutex_repos(true).await {
             for i in 0..20 {
                 let key = Uuid::new_v4().to_string();
-                let mut lock = build_lock(&key, i);
+                let mut lock = build_mutex(&key, i);
                 // WHEN creating a new lock with a new key and tenant-id
                 // THEN it should succeed
-                assert_eq!(1, mutex_repo.create(&lock).await.expect(format!("should create lock i {} - lock {}, provider {}",
-                                                                            i, lock, mutex_repo.provider).as_str()));
+                assert_eq!(1, mutex_repo.create(&lock)
+                    .await.expect("should create lock"));
 
                 // updating data and version
                 let old_version = lock.version.clone();
@@ -335,7 +334,7 @@ mod tests {
 
                 // WHEN acquiring already locked mutex
                 // THEN it should fail
-                assert_eq!(true, mutex_repo.acquire_update(old_version.as_str(), &lock).await.is_err());
+                assert!(mutex_repo.acquire_update(old_version.as_str(), &lock).await.is_err());
 
                 // WHEN fetching mutex with existing lock and tenant-id
                 // THEN it should find it
@@ -367,17 +366,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_update_locks_concurrently_without_read_consistency() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         let repetition_count = 10;
         let thread_count = 2;
         for mutex_repo in build_test_mutex_repos(false).await {
             let mutex_repo = Arc::new(mutex_repo);
             let key = Uuid::new_v4().to_string();
-            let mut lock = build_lock(&key, 0);
+            let mut lock = build_mutex(&key, 0);
             lock.tenant_id = tenant_id.clone();
             // WHEN creating a new lock with a new key and tenant-id
             // THEN it should succeed
-            assert_eq!(1, mutex_repo.create(&lock).await.unwrap());
+            assert_eq!(1, mutex_repo.create(&lock).await.expect("should create mutex"));
 
             let mut tasks = vec![];
             for _i in 0..thread_count {
@@ -399,10 +398,10 @@ mod tests {
         for mutex_repo in build_test_mutex_repos(true).await {
             let mutex_repo = Arc::new(mutex_repo);
             let key = Uuid::new_v4().to_string();
-            let lock = build_lock(&key, 0);
+            let lock = build_mutex(&key, 0);
             // WHEN creating a new lock with a new key and tenant-id
             // THEN it should succeed
-            assert_eq!(1, mutex_repo.create(&lock).await.unwrap());
+            assert_eq!(1, mutex_repo.create(&lock).await.expect("should create mutex"));
 
             let mut tasks = vec![];
             for _i in 0..thread_count {
@@ -418,20 +417,24 @@ mod tests {
     async fn repeat_update_locks(mutex_repo: &Arc<repository::MeasurableMutexRepository>, repetition_count: i32, lock: &MutexLock) -> Duration {
         let now = Instant::now();
         for _j in 0..repetition_count {
-            update_test_lock(&mutex_repo, lock, 0).await;
+            update_test_lock(mutex_repo, lock, 0).await;
         }
         now.elapsed()
     }
 
     #[async_recursion]
-    async fn update_test_lock(mutex_repo: &Arc<repository::MeasurableMutexRepository>, lock: &MutexLock, retries: usize) {
-        let loaded = mutex_repo.get(lock.mutex_key.as_str(), lock.tenant_id.as_str()).await.unwrap();
+    async fn update_test_lock(
+        mutex_repo: &Arc<repository::MeasurableMutexRepository>,
+        lock: &MutexLock, retries: usize) {
+        let loaded = mutex_repo.get(
+            lock.mutex_key.as_str(), lock.tenant_id.as_str()).await.unwrap();
         assert_eq!(*lock, loaded);
-        match mutex_repo.acquire_update(lock.version.as_str(), &lock).await {
+        match mutex_repo.acquire_update(lock.version.as_str(), lock).await {
             Ok(_size) => {
-                assert_eq!(1, mutex_repo.heartbeat_update(lock.version.as_str(), &lock).await.unwrap());
+                assert_eq!(1, mutex_repo.heartbeat_update(lock.version.as_str(), lock).await.unwrap());
                 assert_eq!(1, mutex_repo.release_update(
-                    lock.mutex_key.as_str(), lock.tenant_id.as_str(), lock.version.as_str(), None).await.unwrap());
+                    lock.mutex_key.as_str(), lock.tenant_id.as_str(),
+                    lock.version.as_str(), None).await.unwrap());
             }
             Err(err) => {
                 if retries < 10 {
@@ -444,7 +447,7 @@ mod tests {
         }
     }
 
-    fn build_lock(key: &str, i: i32) -> MutexLock {
+    fn build_mutex(key: &str, i: i32) -> MutexLock {
         let lock = AcquireLockOptionsBuilder::new(key)
             .with_lease_duration_minutes(5)
             .with_data(format!("data_{}", i).as_str())
@@ -459,21 +462,45 @@ mod tests {
     }
 
     async fn build_test_mutex_repos(read_consistency: bool) -> Vec<repository::MeasurableMutexRepository> {
-        env::set_var("RUST_LOG", "info,aws_config=warn,aws_smithy_http=warn,aws_config=warn,aws_sigv4=warn,aws_smithy_http_tower=warn");
-        let _ = env_logger::builder().is_test(true).try_init();
-        let mut config = LocksConfig::new("default_tenant");
+        let _ = env_logger::Builder::from_env(Env::default().default_filter_or(
+            "info,aws_config=warn,aws_smithy_http=warn,aws_config=warn,aws_sigv4=warn,aws_smithy_http_tower=warn")).is_test(true).try_init();
+        let mut config = LocksConfig::new(models::get_default_tenant().as_str());
         config.ddb_read_consistency = Some(read_consistency);
-        vec![
-            repository::MeasurableMutexRepository::new(RepositoryProvider::Ddb,
-                                                       factory::build_mutex_repository(
-                                                           RepositoryProvider::Ddb,
-                                                           &config)
-                                                           .await.expect("failed to build DDB mutex repository")),
-            repository::MeasurableMutexRepository::new(RepositoryProvider::Rdb,
-                                                       factory::build_mutex_repository(
-                                                           RepositoryProvider::Rdb,
-                                                           &config)
-                                                           .await.expect("failed to build RDB mutex repository")),
-        ]
+        config.redis_url = Some(String::from("redis://192.168.1.102"));
+        let mut repos = vec![];
+        if let Ok(repo) = factory::build_measurable_mutex_repository(
+            RepositoryProvider::Redis, &config).await {
+            match repo.ping().await {
+                Ok(_) => {
+                    repos.push(repo);
+                }
+                Err(err) => {
+                    log::error!("failed to validate Redis repo {}", err);
+                }
+            }
+        }
+        if let Ok(repo) = factory::build_measurable_mutex_repository(
+            RepositoryProvider::Rdb, &config).await {
+            match repo.ping().await {
+                Ok(_) => {
+                    repos.push(repo);
+                }
+                Err(err) => {
+                    log::error!("failed to validate RDB repo {}", err);
+                }
+            }
+        }
+        if let Ok(repo) = factory::build_measurable_mutex_repository(
+            RepositoryProvider::Ddb, &config).await {
+            match repo.ping().await {
+                Ok(_) => {
+                    repos.push(repo);
+                }
+                Err(err) => {
+                    log::error!("failed to validate DDB repo {}", err);
+                }
+            }
+        }
+        repos
     }
 }

@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use prometheus::default_registry;
 
-use crate::domain::models::{LockError, LockResult, LocksConfig, MutexLock, PaginatedResult, RepositoryProvider, Semaphore};
+use crate::domain::models::{LockResult, LocksConfig, MutexLock, PaginatedResult, RepositoryProvider, Semaphore};
 use crate::utils::lock_metrics::LockMetrics;
 
 pub mod factory;
@@ -14,10 +14,13 @@ pub mod orm_mutex_repository;
 pub mod orm_semaphore_repository;
 pub mod ddb_mutex_repository;
 pub mod ddb_semaphore_repository;
-pub mod redis_repository;
+pub mod redis_mutex_repository;
+pub mod redis_semaphore_repository;
 pub mod ddb_common;
+pub mod redis_fair_semaphore_repository;
 mod mutex_repository_tests;
 mod semaphore_repository_tests;
+mod redis_common;
 
 macro_rules! pool_decl {
     () => {
@@ -36,6 +39,7 @@ macro_rules! build_pool {
 // allow access to macros - must be below macro definition
 pub(crate) use build_pool;
 pub(crate) use pool_decl;
+use crate::domain::error::LockError;
 
 #[async_trait]
 pub trait MutexRepository {
@@ -43,17 +47,17 @@ pub trait MutexRepository {
     async fn setup_database(&self, recreate: bool) -> LockResult<()>;
 
     // create lock item
-    async fn create(&self, lock: &MutexLock) -> LockResult<usize>;
+    async fn create(&self, mutex: &MutexLock) -> LockResult<usize>;
 
     // updates existing lock item for acquire
     async fn acquire_update(&self,
                             old_version: &str,
-                            lock: &MutexLock) -> LockResult<usize>;
+                            mutex: &MutexLock) -> LockResult<usize>;
 
     // updates existing lock item for heartbeat
     async fn heartbeat_update(&self,
                               old_version: &str,
-                              lock: &MutexLock) -> LockResult<usize>;
+                              mutex: &MutexLock) -> LockResult<usize>;
 
     // updates existing lock item for release
     async fn release_update(&self,
@@ -91,6 +95,10 @@ pub trait MutexRepository {
                                page: Option<&str>,
                                page_size: usize,
     ) -> LockResult<PaginatedResult<MutexLock>>;
+
+    async fn ping(&self) -> LockResult<()>;
+
+    fn eventually_consistent(&self) -> bool;
 }
 
 #[async_trait]
@@ -123,6 +131,64 @@ pub trait SemaphoreRepository {
                                page: Option<&str>,
                                page_size: usize,
     ) -> LockResult<PaginatedResult<Semaphore>>;
+
+    async fn ping(&self) -> LockResult<()>;
+
+    fn eventually_consistent(&self) -> bool;
+}
+
+#[async_trait]
+pub trait FairSemaphoreRepository {
+    // run migrations or create table if necessary
+    async fn setup_database(&self, recreate: bool) -> LockResult<()>;
+
+    async fn create(&self, semaphore: &Semaphore) -> LockResult<usize>;
+
+    // find by key and tenant_id
+    async fn get(&self,
+                 other_key: &str,
+                 other_tenant_id: &str) -> LockResult<Semaphore>;
+
+    // delete semaphore
+    async fn delete(&self,
+                    other_key: &str,
+                    other_tenant_id: &str,
+                    other_version: &str) -> LockResult<usize>;
+
+    // updates existing lock item for acquire
+    async fn acquire_update(&self,
+                            semaphore: &Semaphore) -> LockResult<MutexLock>;
+
+    // updates existing lock item for heartbeat
+    async fn heartbeat_update(&self,
+                              other_key: &str,
+                              other_tenant_id: &str,
+                              other_version: &str,
+                              lease_duration_ms: i64) -> LockResult<usize>;
+
+    // updates existing lock item for release
+    async fn release_update(&self,
+                            other_key: &str,
+                            other_tenant_id: &str,
+                            other_version: &str,
+                            other_data: Option<&str>) -> LockResult<usize>;
+
+    // find locks by semaphore
+    async fn get_semaphore_mutexes(&self,
+                                   other_key: &str,
+                                   other_tenant_id: &str,
+    ) -> LockResult<Vec<MutexLock>>;
+
+    // find by tenant_id
+    async fn find_by_tenant_id(&self,
+                               other_tenant_id: &str,
+                               page: Option<&str>,
+                               page_size: usize,
+    ) -> LockResult<PaginatedResult<Semaphore>>;
+
+    async fn ping(&self) -> LockResult<()>;
+
+    fn eventually_consistent(&self) -> bool;
 }
 
 async fn invoke_with_retry_attempts<T, F: Fn() -> R, R>(config: &LocksConfig, msg: &str, f: F) -> LockResult<T>
@@ -155,11 +221,11 @@ pub(crate) struct RetryableMutexRepository {
 }
 
 impl RetryableMutexRepository {
-    fn new(config: &LocksConfig, delegate: Box<dyn MutexRepository + Send + Sync>) -> Box<dyn MutexRepository + Send + Sync> {
-        Box::new(RetryableMutexRepository {
+    fn new(config: &LocksConfig, delegate: Box<dyn MutexRepository + Send + Sync>) -> Self {
+        RetryableMutexRepository {
             config: config.clone(),
             delegate,
-        })
+        }
     }
 }
 
@@ -171,21 +237,21 @@ impl MutexRepository for RetryableMutexRepository {
         }).await
     }
 
-    async fn create(&self, lock: &MutexLock) -> LockResult<usize> {
+    async fn create(&self, mutex: &MutexLock) -> LockResult<usize> {
         invoke_with_retry_attempts(&self.config, "create", || async {
-            self.delegate.create(lock).await
+            self.delegate.create(mutex).await
         }).await
     }
 
-    async fn acquire_update(&self, old_version: &str, lock: &MutexLock) -> LockResult<usize> {
+    async fn acquire_update(&self, old_version: &str, mutex: &MutexLock) -> LockResult<usize> {
         invoke_with_retry_attempts(&self.config, "acquire_update", || async {
-            self.delegate.acquire_update(old_version, lock).await
+            self.delegate.acquire_update(old_version, mutex).await
         }).await
     }
 
-    async fn heartbeat_update(&self, old_version: &str, lock: &MutexLock) -> LockResult<usize> {
+    async fn heartbeat_update(&self, old_version: &str, mutex: &MutexLock) -> LockResult<usize> {
         invoke_with_retry_attempts(&self.config, "heartbeat_update", || async {
-            self.delegate.heartbeat_update(old_version, lock).await
+            self.delegate.heartbeat_update(old_version, mutex).await
         }).await
     }
 
@@ -235,6 +301,103 @@ impl MutexRepository for RetryableMutexRepository {
             self.delegate.find_by_semaphore(semaphore_key, other_tenant_id, page, page_size).await
         }).await
     }
+
+    // no retry
+    async fn ping(&self) -> LockResult<()> {
+        self.delegate.ping().await
+    }
+
+    fn eventually_consistent(&self) -> bool {
+        self.delegate.eventually_consistent()
+    }
+}
+
+pub(crate) struct RetryableFairSemaphoreRepository {
+    config: LocksConfig,
+    delegate: Box<dyn FairSemaphoreRepository + Send + Sync>,
+}
+
+impl RetryableFairSemaphoreRepository {
+    fn new(config: &LocksConfig, delegate: Box<dyn FairSemaphoreRepository + Send + Sync>) -> Self {
+        RetryableFairSemaphoreRepository {
+            config: config.clone(),
+            delegate,
+        }
+    }
+}
+
+#[async_trait]
+impl FairSemaphoreRepository for RetryableFairSemaphoreRepository {
+    async fn setup_database(&self, recreate: bool) -> LockResult<()> {
+        invoke_with_retry_attempts(&self.config, "setup_database", || async {
+            self.delegate.setup_database(recreate).await
+        }).await
+    }
+
+    async fn create(&self, semaphore: &Semaphore) -> LockResult<usize> {
+        invoke_with_retry_attempts(&self.config, "create", || async {
+            self.delegate.create(semaphore).await
+        }).await
+    }
+
+    async fn get(&self, other_key: &str, other_tenant_id: &str) -> LockResult<Semaphore> {
+        invoke_with_retry_attempts(&self.config, "get", || async {
+            self.delegate.get(other_key, other_tenant_id).await
+        }).await
+    }
+
+    async fn delete(&self, other_key: &str, other_tenant_id: &str, other_version: &str) -> LockResult<usize> {
+        invoke_with_retry_attempts(&self.config, "delete", || async {
+            self.delegate.delete(other_key, other_tenant_id, other_version).await
+        }).await
+    }
+
+    async fn find_by_tenant_id(&self,
+                               other_tenant_id: &str,
+                               page: Option<&str>,
+                               page_size: usize) -> LockResult<PaginatedResult<Semaphore>> {
+        invoke_with_retry_attempts(&self.config, "find_by_tenant_id", || async {
+            self.delegate.find_by_tenant_id(other_tenant_id, page, page_size).await
+        }).await
+    }
+
+    async fn acquire_update(&self, semaphore: &Semaphore) -> LockResult<MutexLock> {
+        invoke_with_retry_attempts(&self.config, "acquire_update", || async {
+            self.delegate.acquire_update(semaphore).await
+        }).await
+    }
+
+    async fn heartbeat_update(&self,
+                              other_key: &str,
+                              other_tenant_id: &str,
+                              other_version: &str,
+                              lease_duration_ms: i64) -> LockResult<usize> {
+        invoke_with_retry_attempts(&self.config, "heartbeat_update", || async {
+            self.delegate.heartbeat_update(other_key, other_tenant_id, other_version, lease_duration_ms).await
+        }).await
+    }
+
+    async fn release_update(&self, other_key: &str, other_tenant_id: &str, other_version: &str, other_data: Option<&str>) -> LockResult<usize> {
+        invoke_with_retry_attempts(&self.config, "release_update", || async {
+            self.delegate.release_update(other_key, other_tenant_id, other_version, other_data).await
+        }).await
+    }
+
+    async fn get_semaphore_mutexes(&self, other_key: &str, other_tenant_id: &str) -> LockResult<Vec<MutexLock>> {
+        invoke_with_retry_attempts(&self.config, "get_semaphore_mutexes", || async {
+            self.delegate.get_semaphore_mutexes(other_key, other_tenant_id).await
+        }).await
+    }
+
+    // No retry
+    async fn ping(&self) -> LockResult<()> {
+        self.delegate.ping().await
+    }
+
+    fn eventually_consistent(&self) -> bool {
+        self.delegate.eventually_consistent()
+    }
+
 }
 
 pub(crate) struct RetryableSemaphoreRepository {
@@ -243,11 +406,11 @@ pub(crate) struct RetryableSemaphoreRepository {
 }
 
 impl RetryableSemaphoreRepository {
-    fn new(config: &LocksConfig, delegate: Box<dyn SemaphoreRepository + Send + Sync>) -> Box<dyn SemaphoreRepository + Send + Sync> {
-        Box::new(RetryableSemaphoreRepository {
+    fn new(config: &LocksConfig, delegate: Box<dyn SemaphoreRepository + Send + Sync>) -> Self {
+        RetryableSemaphoreRepository {
             config: config.clone(),
             delegate,
-        })
+        }
     }
 }
 
@@ -291,6 +454,15 @@ impl SemaphoreRepository for RetryableSemaphoreRepository {
             self.delegate.find_by_tenant_id(other_tenant_id, page, page_size).await
         }).await
     }
+
+    // No retry
+    async fn ping(&self) -> LockResult<()> {
+        self.delegate.ping().await
+    }
+
+    fn eventually_consistent(&self) -> bool {
+        self.delegate.eventually_consistent()
+    }
 }
 
 pub(crate) struct MeasurableMutexRepository {
@@ -304,7 +476,8 @@ impl MeasurableMutexRepository {
         MeasurableMutexRepository {
             provider,
             delegate,
-            metrics: LockMetrics::new(format!("{}__", provider).as_str(), &default_registry()).unwrap(),
+            metrics: LockMetrics::new(format!("{}__", provider).as_str(),
+                                      default_registry()).unwrap(),
         }
     }
 
@@ -331,19 +504,19 @@ impl MutexRepository for MeasurableMutexRepository {
         self.delegate.setup_database(recreate).await
     }
 
-    async fn create(&self, lock: &MutexLock) -> LockResult<usize> {
+    async fn create(&self, mutex: &MutexLock) -> LockResult<usize> {
         let _metric = self.metrics.new_metric("create");
-        self.delegate.create(lock).await
+        self.delegate.create(mutex).await
     }
 
-    async fn acquire_update(&self, old_version: &str, lock: &MutexLock) -> LockResult<usize> {
+    async fn acquire_update(&self, old_version: &str, mutex: &MutexLock) -> LockResult<usize> {
         let _metric = self.metrics.new_metric("acquire_update");
-        self.delegate.acquire_update(old_version, lock).await
+        self.delegate.acquire_update(old_version, mutex).await
     }
 
-    async fn heartbeat_update(&self, old_version: &str, lock: &MutexLock) -> LockResult<usize> {
+    async fn heartbeat_update(&self, old_version: &str, mutex: &MutexLock) -> LockResult<usize> {
         let _metric = self.metrics.new_metric("heartbeat_update");
-        self.delegate.heartbeat_update(old_version, lock).await
+        self.delegate.heartbeat_update(old_version, mutex).await
     }
 
     async fn release_update(&self,
@@ -386,6 +559,14 @@ impl MutexRepository for MeasurableMutexRepository {
         let _metric = self.metrics.new_metric("find_by_semaphore");
         self.delegate.find_by_semaphore(semaphore_key, other_tenant_id, page, page_size).await
     }
+
+    async fn ping(&self) -> LockResult<()> {
+        self.delegate.ping().await
+    }
+
+    fn eventually_consistent(&self) -> bool {
+        self.delegate.eventually_consistent()
+    }
 }
 
 pub(crate) struct MeasurableSemaphoreRepository {
@@ -404,7 +585,8 @@ impl MeasurableSemaphoreRepository {
             provider,
             delegate,
             mutex_repository,
-            metrics: LockMetrics::new(format!("{}__", provider).as_str(), &default_registry()).unwrap(),
+            metrics: LockMetrics::new(format!("{}__", provider).as_str(),
+                                      default_registry()).unwrap(),
         }
     }
 
@@ -460,5 +642,14 @@ impl SemaphoreRepository for MeasurableSemaphoreRepository {
                                page: Option<&str>, page_size: usize) -> LockResult<PaginatedResult<Semaphore>> {
         let _metric = self.metrics.new_metric("find_by_tenant_id");
         self.delegate.find_by_tenant_id(other_tenant_id, page, page_size).await
+    }
+
+    async fn ping(&self) -> LockResult<()> {
+        let _metric = self.metrics.new_metric("ping");
+        self.delegate.ping().await
+    }
+
+    fn eventually_consistent(&self) -> bool {
+        self.delegate.eventually_consistent()
     }
 }

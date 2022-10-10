@@ -1,30 +1,48 @@
 # db_locks
+Distributed Locks using Databases
 
 ## Mutex and Semaphores
-This is a Rust library for providing database based Mutex and Semaphores with support of relationa databases and AWS Dynamo DB.
+This is a Rust library for providing distributed Mutex and Semaphore based locks using databases.
+The project goals include:
+- Allow creating lease based locks that can either a single shared resource with a Mutex or a fixed set of related resources with a Semaphore.
+- Allow renewing leases based on periodic intervals.
+- Allow releasing mutex and semaphore locks explicitly after the serialized action.
+- CRUD APIs to manage Mutex and Semaphore entities in the database.
+- Multi-tenancy support if the database is shared by multiple users.
+- Fair locks to support first-come and first serve based access grant.
+- Scalable solution for supporting tens of thousands concurrent locks.
+- Support popular relational databases such as MySQL, PostgreSQL, Sqlite and other data stores such as AWS Dynamo DB (Consistent reads) and Redis.
 
 ### Create Lock Manager
-The LockManager abstracts operations for acquiring, releasing, renewing leases, etc.
+The LockManager abstracts operations for acquiring, releasing, renewing leases, etc for distributed locks. You can instantiate it as follows:
 ```rust
 let config = LocksConfig::new("test_tenant");
-let mutex_repo = build_test_mutex_repo(&config, RepositoryProvider::RDB).await;
-let semaphore_repo = build_test_semaphore_repo(&config, RepositoryProvider::RDB).await;
-let lock_manager = LocksManagerImpl::new(&config, mutex_repo, semaphore_repo, &default_registry()).expect("failed to initialize lock manager");
+let mutex_repo = factory::build_mutex_repository(RepositoryProvider::Rdb, &config).await.expect("failed to build mutex repository");
+let semaphore_repo = factory::build_semaphore_repository(RepositoryProvider::Rdb, &config).await.expect("failed to build semaphore repository");
+let store = Box::new(DefaultLockStore::new(&config, mutex_repo, semaphore_repo));
+
+let locks_manager = LockManagerImpl::new(args.provider, &config, store, &default_registry()).expect("failed to initialize lock manager");
 ```
 
-The db_locks uses https://diesel.rs/ library for ORM and you can customize it to any suported database. You can switch to 
-AWS Dynamo DB using:
+The db_locks uses https://diesel.rs/ library for ORM when using relational databases and you can 
+customize it to any suported database. However, you can switch to AWS Dynamo DB or Redis using:
 ```rust
-let mutex_repo = build_test_mutex_repo(&config, RepositoryProvider::DDB).await;
-let semaphore_repo = build_test_semaphore_repo(&config, RepositoryProvider::DDB).await;
+let mutex_repo = factory::build_mutex_repository(RepositoryProvider::Ddb, &config).await.expect("failed to build mutex repository");
+let semaphore_repo = factory::build_semaphore_repository(RepositoryProvider::Ddb, &config).await.expect("failed to build semaphore repository");
+let store = Box::new(DefaultLockStore::new(&config, mutex_repo, semaphore_repo));
+```
+or
+```rust
+let mutex_repo = factory::build_mutex_repository(RepositoryProvider::Redis, &config).await.expect("failed to build mutex repository");
+let semaphore_repo = factory::build_semaphore_repository(RepositoryProvider::Redis, &config).await.expect("failed to build semaphore repository");
+let store = Box::new(DefaultLockStore::new(&config, mutex_repo, semaphore_repo));
 ```
 
 ### Acquiring Mutex Lock
 You can build options for acquiring with key name and lease period in milliseconds and then acquire it:
 
 ```rust
-let acquire_opts = AcquireLockOptionsBuilder::new("mylock")
-            .with_lease_duration_secs(10).build();
+let acquire_opts = AcquireLockOptionsBuilder::new("mylock").with_lease_duration_secs(10).build();
 let lock = lock_manager.acquire_lock(&acquire_opts).expect("should acquire lock");
 ```
 The acquire_lock will automatically create lock if it doesn't exist and wait for the period of lease-time if lock is not available.
@@ -47,25 +65,15 @@ lock_manager.release_lock(&release_opts).expect("should release lock");
 ```
 The release request may optionally delete the lock otherwise it will reuse same lock object in the database.
 
-### Creating Semaphores
-The semaphores allow you to define a set of locks for a resource with a maximum size. You will first
-need to create semaphores before using it unlike locks that can be created on demand, e.g.:
-
-```rust
-let semaphore = SemaphoreBuilder::new("my_pool", 20)
-                .with_lease_duration_secs(10)
-                .build();
-lock_manager.create_semaphore(&semaphore).expect("should create semaphore");
-```
-Above operation will create a semaphore of size 20 with default lease of 10 second. You can also use this API to change size of semaphore locks.
-
 ### Acquiring Semaphores
-The operation for acquiring semaphore is similar to acquiring regular lock except you specify that it uses semaphore, e.g.:
+The semaphores allow you to define a set of locks for a resource with a maximum size. The operation 
+for acquiring semaphore is similar to acquiring regular lock except you specify that it uses semaphore, e.g.:
 
 ```rust
-let acquire_opts = AcquireLockOptionsBuilder::new("my_pool".to_string())
-            .with_requires_semaphore(true)
-            .with_lease_duration_secs(10).build();
+let acquire_opts = AcquireLockOptionsBuilder::new("my_pool")
+                    .with_lease_duration_secs(1)
+                    .with_semaphore_max_size(10)
+                    .build();
 let lock = lock_manager.acquire_lock(&acquire_opts).expect("should acquire semaphore lock");
 ```
 
@@ -85,8 +93,28 @@ let release_opts = updated_lock.to_release_options();
 lock_manager.release_lock(&release_opts).expect("should release lock");
 ```
 
+### Acquiring Fair Semaphores
+The fair semaphores is only availble for Redis, and it requires enabling it via fair_semaphore configuration
+option, otherwise it's similar to above operations, e.g.:
+```rust
+let mut config = LocksConfig::new("test_tenant");
+config.fair_semaphore = Some(fair_semaphore);
+let fair_semaphore_repo = factory::build_fair_semaphore_repository(RepositoryProvider::Redis, &config).await.expect("failed to create fair semaphore");
+let store = Box::new(FairLockStore::new(&config, fair_semaphore_repo));
+let locks_manager = LockManagerImpl::new(args.provider, &config, store, &default_registry()).expect("failed to initialize lock manager");
+```
+
+```rust
+let acquire_opts = AcquireLockOptionsBuilder::new("my_pool")
+                    .with_lease_duration_secs(1)
+                    .with_semaphore_max_size(10)
+                    .build();
+let lock = lock_manager.acquire_lock(&acquire_opts).expect("should acquire semaphore lock");
+```
+
 ## Setup
 
+### Relational Database
 Install diesel cli:
 ```shell
 brew install libpq
@@ -96,7 +124,7 @@ cargo install diesel_cli --no-default-features --features sqlite
 cargo install diesel_cli --no-default-features --features postgres
 ```
 
-Set URL to database
+Set URL to relational database
 ```shell
 export DATABASE_URL=postgres://<postgres_username>:<postgres_password>@<postgres_host>:<postgres_port>/school
 ```
@@ -107,13 +135,26 @@ diesel setup
 diesel migration run
 ```
 
-
-## Execute
-
 Put database in vanilla state
 ```shell
 diesel migration redo
 ```
+
+### Redis
+Set URL to Redis database
+```shell
+export REDIS_URL=redis://192.168.1.102
+```
+
+### AWS Dynamo DB
+You can specify environment variables for AWS access based on https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html, e.g.
+```shell
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_DEFAULT_REGION=us-west-2
+```
+
+## Execute
 
 Run lock server
 ```shell
@@ -123,7 +164,7 @@ This will show following command line options
 ```shell
 Database based Mutexes and Semaphores
 
-Usage: db-locks [PROVIDER] <COMMAND>
+Usage: db-locks [OPTIONS] [PROVIDER] <COMMAND>
 
 Commands:
   acquire
@@ -135,6 +176,8 @@ Commands:
   get-mutex
 
   delete-mutex
+
+  create-mutex
 
   create-semaphore
 
@@ -153,11 +196,31 @@ Arguments:
 
 Options:
   -t, --tenant <TENANT>
-          tentant-id for the database [default: default]
+          tentant-id for the database [default: local-host-name]
+  -f, --fair-semaphore <FAIR_SEMAPHORE>
+          fair semaphore lock [default: false] [possible values: true, false]
   -c, --config <FILE>
           Sets a custom config file
   -h, --help
           Print help information
   -V, --version
           Print version information
+```
+
+### Examples
+
+#### Acquiring Fair lock
+```bash
+REDIS_URL=redis://192.168.1.102 cargo run -- --fair-semaphore true redis acquire --key one
+```
+
+#### Refresh Fair lock
+```bash
+REDIS_URL=redis://192.168.1.102 cargo run -- --fair-semaphore true redis heartbeat --key one --version 4bc177f3-383b-4f88-9c63-034f7d2fdcd6
+```
+
+#### Release Fair lock
+```bash
+REDIS_URL=redis://192.168.1.102 cargo run -- --fair-semaphore true redis acquire --key one
+```
 ```

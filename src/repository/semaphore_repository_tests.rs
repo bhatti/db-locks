@@ -3,6 +3,7 @@ mod tests {
     use std::cmp;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Instant;
 
     use async_recursion::async_recursion;
     use env_logger::Env;
@@ -10,6 +11,7 @@ mod tests {
     use rand::Rng;
     use tokio::time::Duration;
     use uuid::Uuid;
+    use crate::domain::models;
 
     use crate::domain::models::{LocksConfig, MutexLock, PaginatedResult, RepositoryProvider, Semaphore, SemaphoreBuilder};
     use crate::repository::{factory, MeasurableMutexRepository, MeasurableSemaphoreRepository, MutexRepository, SemaphoreRepository};
@@ -25,7 +27,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_create_and_load_semaphore() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         // GIVEN mutex repository
         for semaphore_repo in build_test_semaphore_repos(true).await {
             let key = Uuid::new_v4().to_string();
@@ -44,17 +46,17 @@ mod tests {
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
 
             // WHEN searching mutexes by semaphore-key
-            let locks = get_mutexes_by_semaphore_key(
-                &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 1000).await;
+            let locks = get_semaphore_mutexes(
+                &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 10).await;
             // THEN it should find those records
             assert_eq!(10, locks.records.len());
-            log::info!("metrics {}", semaphore_repo.dump_metrics());
+            assert!(!semaphore_repo.dump_metrics().is_empty());
         }
     }
 
     #[tokio::test]
     async fn test_should_not_delete_acquired_mutexes() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         // GIVEN mutex repository
         for semaphore_repo in build_test_semaphore_repos(true).await {
             let key = Uuid::new_v4().to_string();
@@ -73,7 +75,7 @@ mod tests {
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
 
             // WHEN searching mutexes by semaphore-key
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 50).await;
             // THEN it should find those records
             assert_eq!(50, locks.records.len());
@@ -85,7 +87,7 @@ mod tests {
             for (i, lock) in locks.records.iter().enumerate() {
                 if i < 20 {
                     assert_eq!(1, semaphore_repo.mutex_repository.acquire_update(
-                        lock.version.as_str(), &lock).await.unwrap());
+                        lock.version.as_str(), lock).await.unwrap());
                     acquired.insert(lock.version.clone(), lock.mutex_key.clone());
                 }
             }
@@ -97,12 +99,12 @@ mod tests {
                     assert_eq!(1, semaphore_repo.mutex_repository.delete_expired_lock(
                         lock.mutex_key.as_str(), lock.tenant_id.as_str()).await.unwrap());
                 } else {
-                    assert_eq!(true, semaphore_repo.mutex_repository.delete_expired_lock(
+                    assert!(semaphore_repo.mutex_repository.delete_expired_lock(
                         lock.mutex_key.as_str(), lock.tenant_id.as_str()).await.is_err());
                 }
             }
             // AND we should not find deleted locks
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 20).await;
             assert_eq!(20, locks.records.len());
         }
@@ -110,7 +112,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_delete_expired_mutexes() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         // GIVEN mutex repository
         for semaphore_repo in build_test_semaphore_repos(true).await {
             let key = Uuid::new_v4().to_string();
@@ -129,21 +131,24 @@ mod tests {
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
 
             // WHEN searching mutexes by semaphore-key
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 30).await;
             // THEN it should find those records
             assert_eq!(30, locks.records.len());
 
             // WHEN deleting expired mutexes
             // THEN it should succeed
+            let mut deleted = 0;
             for (i, lock) in locks.records.iter().enumerate() {
                 if i < 10 {
                     assert_eq!(1, semaphore_repo.mutex_repository.delete_expired_lock(
                         lock.mutex_key.as_str(), lock.tenant_id.as_str()).await.unwrap());
+                    deleted += 1;
                 }
             }
+            assert_eq!(10, deleted);
             // AND we should find remaining locks
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 20).await;
             assert_eq!(20, locks.records.len());
         }
@@ -151,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_not_resize_to_smaller_semaphore_after_acquire_lock() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         // GIVEN mutex repository
         for semaphore_repo in build_test_semaphore_repos(true).await {
             let key = Uuid::new_v4().to_string();
@@ -170,7 +175,7 @@ mod tests {
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
 
             // querying only 40 mutexes though we added 50
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 40).await;
 
             let mut acquired = HashMap::new();
@@ -186,7 +191,7 @@ mod tests {
             // WHEN resizing semaphore to smaller size
             semaphore.max_size = 30;
             // THEN it should fail
-            assert_eq!(true, semaphore_repo.update(
+            assert!(semaphore_repo.update(
                 semaphore.version.as_str(), &semaphore).await.is_err());
 
             // Now release 40 locks
@@ -204,7 +209,7 @@ mod tests {
 
             assert_eq!(semaphore, semaphore_repo.get(
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 30).await;
             // we locked 40 locks so those should not be deleted
             assert_eq!(30, locks.records.len());
@@ -213,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_resize_semaphore_without_lock() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         // GIVEN mutex repository
         for semaphore_repo in build_test_semaphore_repos(true).await {
             let key = Uuid::new_v4().to_string();
@@ -225,7 +230,7 @@ mod tests {
             assert_eq!(1, semaphore_repo.create(&semaphore).await.unwrap());
             assert_eq!(semaphore, semaphore_repo.get(
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 50).await;
             assert_eq!(50, locks.records.len());
 
@@ -234,7 +239,7 @@ mod tests {
                 semaphore.version.as_str(), &semaphore).await.unwrap());
             assert_eq!(semaphore, semaphore_repo.get(
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 50).await;
             assert_eq!(50, locks.records.len());
 
@@ -243,7 +248,7 @@ mod tests {
                 semaphore.version.as_str(), &semaphore).await.unwrap());
             assert_eq!(semaphore, semaphore_repo.get(
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 100).await;
             assert_eq!(100, locks.records.len());
 
@@ -252,7 +257,7 @@ mod tests {
                 semaphore.version.as_str(), &semaphore).await.unwrap());
             assert_eq!(semaphore, semaphore_repo.get(
                 semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).await.unwrap());
-            let locks = get_mutexes_by_semaphore_key(
+            let locks = get_semaphore_mutexes(
                 &semaphore_repo.provider, &semaphore_repo.mutex_repository, &semaphore, 20).await;
             assert_eq!(20, locks.records.len());
         }
@@ -260,7 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_not_get_semaphore_after_delete() {
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         // GIVEN mutex repository
         for semaphore_repo in build_test_semaphore_repos(true).await {
             let key = Uuid::new_v4().to_string();
@@ -281,7 +286,7 @@ mod tests {
             assert_eq!(1, semaphore_repo.delete(
                 key.as_str(), after_insert.tenant_id.as_str(), after_insert.version.as_str()).await.unwrap());
             // THEN it should not find it
-            assert_eq!(true, semaphore_repo.get(
+            assert!(semaphore_repo.get(
                 key.as_str(), semaphore.tenant_id.as_str()).await.is_err());
         }
     }
@@ -289,36 +294,41 @@ mod tests {
     #[tokio::test]
     async fn test_should_paginate_query_by_semaphore_key() {
         // GIVEN mutex repository, tenant-id and semaphore-id
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         for semaphore_repo in build_test_semaphore_repos(true).await {
             // GIVEN initialize data with test data
-            let key = format!("SEMAPHORE_{}", Uuid::new_v4().to_string());
-            let mut semaphore = SemaphoreBuilder::new(key.as_str(), 1000)
+            let key = format!("SEMAPHORE_{}", Uuid::new_v4());
+            let mut semaphore = SemaphoreBuilder::new(key.as_str(), 120)
                 .with_lease_duration_millis(500)
                 .build();
             semaphore.tenant_id = tenant_id.clone();
             assert_eq!(1, semaphore_repo.create(&semaphore).await.unwrap());
             let mut next_page: Option<String> = None;
-            for i in 0..6 {
+            let mut keys = HashMap::new();
+            for i in 0..7 {
                 if i == 5 && next_page == None {
                     continue;
                 }
                 // WHEN finding mutexes by tenant-id
                 let res = semaphore_repo.mutex_repository.find_by_semaphore(
-                    key.as_str(), tenant_id.as_str(), next_page.as_deref(), 100)
-                    .await.expect(format!("failed to find by semaphore-key i {} next {:?}, tenant {:?}, semaphore {:?}",
-                                          i, next_page, tenant_id, key).as_str());
+                    key.as_str(), tenant_id.as_str(), next_page.as_deref(), 20)
+                    .await.expect("failed to find by semaphore-key");
                 // THEN it should find saved data
-                if i == 5 {
+                if i == 6 {
                     assert_eq!(0, res.records.len(), "unexpected result for page {} - {}", i, res.records.len());
                 } else {
-                    assert_eq!(100, res.records.len());
+                    assert!(!res.records.is_empty());
+                }
+                for rec in res.records {
+                    keys.insert(rec.mutex_key, true);
                 }
                 next_page = res.next_page.clone();
             }
-            assert_eq!(None, next_page);
+            assert!(None == next_page || Some("-1".to_string()) == next_page);
+            assert_eq!(120, keys.len());
             for (k, v) in semaphore_repo.metrics_summary() {
-                log::info!("metrics {} = {}", k, v);
+                assert!(!k.is_empty());
+                assert!(v >= 0.0);
             }
         }
     }
@@ -326,20 +336,18 @@ mod tests {
     #[tokio::test]
     async fn test_should_paginate_query_by_tenant() {
         // GIVEN mutex repository and tenant-id
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         for semaphore_repo in build_test_semaphore_repos(true).await {
             // GIVEN initialize data with test data
-            for i in 0..100 {
-                let key = format!("SEMAPHORE_{}", Uuid::new_v4().to_string());
+            for _i in 0..100 {
+                let key = format!("SEMAPHORE_{}", Uuid::new_v4());
                 let mut semaphore = SemaphoreBuilder::new(key.as_str(), 5)
                     .with_lease_duration_millis(5)
                     .build();
                 semaphore.tenant_id = tenant_id.clone();
-                semaphore.data = Some(format!("{}", i));
                 assert_eq!(1, semaphore_repo.create(&semaphore).await.unwrap());
             }
             let mut next_page: Option<String> = None;
-            let mut data_map = HashMap::new();
             for i in 0..6 {
                 if i == 5 && next_page == None {
                     continue;
@@ -347,24 +355,22 @@ mod tests {
                 // WHEN finding mutexes by tenant-id
                 let res = semaphore_repo.find_by_tenant_id(
                     tenant_id.as_str(), next_page.as_deref(), 20).await.expect("failed to find by tenant-id");
-                for (_j, sem) in res.records.iter().enumerate() {
-                    data_map.insert(sem.data.clone().unwrap(), true);
-                }
-                // THEN it should find saved data
+                // THEN it should return paginated semaphores
                 if i == 5 {
                     assert_eq!(0, res.records.len(), "unexpected result for page {} - {}", i, res.records.len());
                 } else {
-                    assert_eq!(20, res.records.len());
+                    assert!(!res.records.is_empty());
                 }
                 next_page = res.next_page.clone();
             }
-            assert_eq!(None, next_page);
-            assert_eq!(100, data_map.len());
+            assert!(None == next_page || Some("-1".to_string()) == next_page);
             for (k, v) in semaphore_repo.metrics_summary() {
-                log::info!("metrics {} = {}", k, v);
+                assert!(!k.is_empty());
+                assert!(v >= 0.0);
             }
             for (k, v) in semaphore_repo.mutex_repository.metrics_summary() {
-                log::info!("metrics {} = {}", k, v);
+                assert!(!k.is_empty());
+                assert!(v >= 0.0);
             }
         }
     }
@@ -372,7 +378,7 @@ mod tests {
     #[tokio::test]
     async fn test_should_update_locks_concurrently() {
         // GIVEN mutex repository
-        let tenant_id = format!("TENANT_{}", Uuid::new_v4().to_string());
+        let tenant_id = format!("TENANT_{}", Uuid::new_v4());
         let repetition_count = 10;
         let thread_count = 5;
         for semaphore_repo in build_test_semaphore_repos(true).await {
@@ -395,10 +401,12 @@ mod tests {
             // AND background tasks should complete
             join_all(tasks).await;
             for (k, v) in semaphore_repo.metrics_summary() {
-                log::info!("metrics {} = {}", k, v);
+                assert!(!k.is_empty());
+                assert!(v >= 0.0);
             }
             for (k, v) in semaphore_repo.mutex_repository.metrics_summary() {
-                log::info!("metrics {} = {}", k, v);
+                assert!(!k.is_empty());
+                assert!(v >= 0.0);
             }
         }
     }
@@ -435,20 +443,28 @@ mod tests {
         }
     }
 
-    async fn get_mutexes_by_semaphore_key(
+    async fn get_semaphore_mutexes(
         _provider: &RepositoryProvider,
         mutex_repo: &MeasurableMutexRepository,
         semaphore: &Semaphore,
-        expected_size: usize) -> PaginatedResult<MutexLock> {
+        expected_size: usize,
+    ) -> PaginatedResult<MutexLock> {
+        let started = Instant::now();
         let mut locks: PaginatedResult<MutexLock> = PaginatedResult::new(None, None, expected_size, 0, vec![]);
-        let max_attempts = 20;
+        let max_attempts = 10;
         for i in 0..max_attempts {
             // WHEN finding mutexes by semaphore-key just created
             locks = mutex_repo.find_by_semaphore(
-                semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str(), None, cmp::max(200, expected_size)).await.unwrap();
+                semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str(),
+                None, cmp::max(200, expected_size)).await.unwrap();
+            if i > 0 && locks.records.len() != expected_size {
+                log::info!("get_semaphore_mutexes found {} locks, expected {}, attempt {}, elapsed {:?}",
+               locks.records.len(), expected_size, i, started.elapsed());
+            }
 
             // DDB is eventually consistent so give it a short time
-            if i < 5 || (i < max_attempts - 1 && locks.records.len() != expected_size) {
+            if mutex_repo.eventually_consistent() &&
+                (i < max_attempts - 1 && locks.records.len() != expected_size) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             } else {
@@ -461,19 +477,44 @@ mod tests {
     async fn build_test_semaphore_repos(read_consistency: bool) -> Vec<MeasurableSemaphoreRepository> {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or(
             "info,aws_config=warn,aws_smithy_http=warn,aws_config=warn,aws_sigv4=warn,aws_smithy_http_tower=warn")).is_test(true).try_init();
-        let _ = env_logger::builder().is_test(true).try_init();
-        let mut config = LocksConfig::new("default_tenant");
+        let mut config = LocksConfig::new(models::get_default_tenant().as_str());
         config.ddb_read_consistency = Some(read_consistency);
+        config.redis_url = Some(String::from("redis://192.168.1.102"));
 
-        vec![
-            factory::build_measurable_semaphore_repository(
-                RepositoryProvider::Rdb,
-                &config)
-                .await.expect("failed to build RDB semaphore repository"),
-            factory::build_measurable_semaphore_repository(
-                RepositoryProvider::Ddb,
-                &config)
-                .await.expect("failed to build DDB semaphore repository"),
-        ]
+        let mut repos = vec![];
+        if let Ok(repo) = factory::build_measurable_semaphore_repository(
+            RepositoryProvider::Redis, &config).await {
+            match repo.ping().await {
+                Ok(_) => {
+                    repos.push(repo);
+                }
+                Err(err) => {
+                    log::error!("failed to validate Redis repo {}", err);
+                }
+            }
+        }
+        if let Ok(repo) = factory::build_measurable_semaphore_repository(
+            RepositoryProvider::Rdb, &config).await {
+            match repo.ping().await {
+                Ok(_) => {
+                    repos.push(repo);
+                }
+                Err(err) => {
+                    log::error!("failed to validate RDB repo {}", err);
+                }
+            }
+        }
+        if let Ok(repo) = factory::build_measurable_semaphore_repository(
+            RepositoryProvider::Ddb, &config).await {
+            match repo.ping().await {
+                Ok(_) => {
+                    repos.push(repo);
+                }
+                Err(err) => {
+                    log::error!("failed to validate DDB repo {}", err);
+                }
+            }
+        }
+        repos
     }
 }

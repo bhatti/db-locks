@@ -1,11 +1,12 @@
 use async_trait::async_trait;
 
-use crate::domain::models::{AcquireLockOptions, LockResult, MutexLock, ReleaseLockOptions, Semaphore, SendHeartbeatOptions};
+use crate::domain::models::{LockResult, MutexLock, Semaphore};
+use crate::domain::options::{AcquireLockOptions, ReleaseLockOptions, SendHeartbeatOptions};
 
-pub mod locks_manager;
+pub mod lock_manager;
 
 #[async_trait]
-pub trait LocksManager {
+pub trait LockManager {
     // Attempts to acquire a lock until it either acquires the lock, or a specified additional_time_to_wait_for_lock_ms is
     // reached. This method will poll database based on the refresh_period. If it does not see the lock in database, it
     // will immediately return the lock to the caller. If it does see the lock, it will note the lease expiration on the lock. If
@@ -13,17 +14,20 @@ pub trait LocksManager {
     // will acquire and return it. Otherwise, if it waits for as long as additional_time_to_wait_for_lock_ms without acquiring the
     // lock, then it will return LockError::NotGranted.
     //
-    async fn acquire_lock(&self, options: &AcquireLockOptions) -> LockResult<MutexLock>;
+    async fn acquire_lock(&self, opts: &AcquireLockOptions) -> LockResult<MutexLock>;
 
     // Releases the given lock if the current user still has it, returning true if the lock was
     // successfully released, and false if someone else already stole the lock. Deletes the
     // lock item if it is released and delete_lock_item_on_close is set.
-    async fn release_lock(&self, options: &ReleaseLockOptions) -> LockResult<bool>;
+    async fn release_lock(&self, opts: &ReleaseLockOptions) -> LockResult<bool>;
 
     // Sends a heartbeat to indicate that the given lock is still being worked on.
     // This method will also set the lease duration of the lock to the given value.
     // This will also either update or delete the data from the lock, as specified in the options
-    async fn send_heartbeat(&self, options: &SendHeartbeatOptions) -> LockResult<MutexLock>;
+    async fn send_heartbeat(&self, opts: &SendHeartbeatOptions) -> LockResult<MutexLock>;
+
+    // Creates mutex if doesn't exist
+    async fn create_mutex(&self, mutex: &MutexLock) -> LockResult<usize>;
 
     // Deletes mutex lock if not locked
     async fn delete_mutex(&self,
@@ -44,8 +48,8 @@ pub trait LocksManager {
     async fn get_semaphore(&self, semaphore_key: &str) -> LockResult<Semaphore>;
 
     // find locks by semaphore
-    async fn get_mutexes_for_semaphore(&self,
-                                       other_semaphore_key: &str,
+    async fn get_semaphore_mutexes(&self,
+                                   other_semaphore_key: &str,
     ) -> LockResult<Vec<MutexLock>>;
 
     // Deletes semaphore if all associated locks are not locked

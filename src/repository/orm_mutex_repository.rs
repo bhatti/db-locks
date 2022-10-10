@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use chrono::{NaiveDateTime, Utc};
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
+use diesel_migrations::{FileBasedMigrations, MigrationHarness};
+use crate::domain::error::LockError;
 
-use crate::domain::models::{LockError, LockResult, MutexLock, PaginatedResult};
+use crate::domain::models::{LockResult, MutexLock, PaginatedResult};
 use crate::domain::schema::mutexes;
 use crate::domain::schema::mutexes::dsl::*;
 use crate::repository::MutexRepository;
@@ -15,10 +17,10 @@ pub(crate) struct OrmMutexRepository {
 }
 
 impl OrmMutexRepository {
-    pub(crate) fn new(pool: pool_decl!()) -> Box<dyn MutexRepository + Send + Sync> {
-        Box::new(OrmMutexRepository {
+    pub(crate) fn new(pool: pool_decl!()) -> Self {
+        OrmMutexRepository {
             pool,
-        })
+        }
     }
 }
 
@@ -27,25 +29,37 @@ impl MutexRepository for OrmMutexRepository {
     // run migrations or create table if necessary
     async fn setup_database(&self, _: bool) -> LockResult<()> {
         // run migrations when acquiring data source pool
+        let mut conn = self.pool.get().map_err(|err|
+            LockError::database(
+                format!("failed to get pool connection due to {}", err).as_str(), None, true))?;
+        let migrations = FileBasedMigrations::find_migrations_directory()?;
+        match conn.run_pending_migrations(migrations) {
+            Ok(_) => {}
+            Err(err) => {
+                return Err(LockError::database(
+                    format!("failed to run pending migrations {}", err).as_str(), None, false));
+            }
+        };
+        conn.begin_test_transaction()?;
         Ok(())
     }
 
     // create lock item
-    async fn create(&self, lock: &MutexLock) -> LockResult<usize> {
+    async fn create(&self, mutex: &MutexLock) -> LockResult<usize> {
         let mut conn = self.pool.get().map_err(|err|
             LockError::database(format!("failed to get pool connection due to {}", err).as_str(), None, true))?;
 
         match diesel::insert_into(mutexes::table)
-            .values(lock)
+            .values(mutex)
             .execute(&mut conn) {
             Ok(size) => {
                 if size > 0 {
-                    log::debug!("created mutex lock {} {}", lock, size);
+                    log::debug!("created mutex lock {} {}", mutex, size);
                     Ok(size)
                 } else {
                     Err(LockError::database(
                         format!("failed to insert {}",
-                                lock.mutex_key).as_str(), None, false))
+                                mutex.mutex_key).as_str(), None, false))
                 }
             }
             Err(err) => { Err(LockError::from(err)) }
@@ -98,31 +112,31 @@ impl MutexRepository for OrmMutexRepository {
     // updates existing lock item for heartbeat
     async fn heartbeat_update(&self,
                               old_version: &str,
-                              lock: &MutexLock) -> LockResult<usize> {
+                              mutex: &MutexLock) -> LockResult<usize> {
         let mut conn = self.pool.get().map_err(|err|
             LockError::database(format!("failed to get pool connection due to {}", err).as_str(), None, true))?;
         match diesel::update(
-            mutexes.filter(mutex_key.eq(&lock.mutex_key)
+            mutexes.filter(mutex_key.eq(&mutex.mutex_key)
                 .and(version.eq(&old_version))
-                .and(tenant_id.eq(&lock.tenant_id).or(tenant_id.is(&lock.tenant_id)))
+                .and(tenant_id.eq(&mutex.tenant_id).or(tenant_id.is(&mutex.tenant_id)))
             ))
             .set((
-                version.eq(&lock.version),
-                data.eq(&lock.data),
-                lease_duration_ms.eq(lock.lease_duration_ms),
-                expires_at.eq(lock.expires_at),
+                version.eq(&mutex.version),
+                data.eq(&mutex.data),
+                lease_duration_ms.eq(mutex.lease_duration_ms),
+                expires_at.eq(mutex.expires_at),
                 updated_at.eq(Some(Utc::now().naive_utc())),
-                updated_by.eq(&lock.updated_by),
+                updated_by.eq(&mutex.updated_by),
             ))
             .execute(&mut conn) {
             Ok(size) => {
                 if size > 0 {
-                    log::debug!("updated heartbeat for mutex lock {} {}", lock, size);
+                    log::debug!("updated heartbeat for mutex lock {} {}", mutex, size);
                     Ok(size)
                 } else {
                     Err(LockError::database(
                         format!("failed to find records for updating heartbeat {}",
-                                lock.mutex_key).as_str(), None, false))
+                                mutex.mutex_key).as_str(), None, false))
                 }
             }
             Err(err) => { Err(LockError::from(err)) }
@@ -181,7 +195,7 @@ impl MutexRepository for OrmMutexRepository {
                     return Err(LockError::database(
                         format!("too many lock items for {}, tenant_id {}",
                                 other_key, other_tenant_id).as_str(), None, false));
-                } else if items.len() > 0 {
+                } else if !items.is_empty() {
                     if let Some(lock) = items.pop() {
                         return Ok(lock);
                     }
@@ -232,7 +246,7 @@ impl MutexRepository for OrmMutexRepository {
         let now = Some(Utc::now().naive_utc());
         match diesel::delete(
             mutexes
-                .filter(mutex_key.eq(other_key.clone())
+                .filter(mutex_key.eq(other_key)
                     .and(tenant_id.eq(&other_tenant_id).or(tenant_id.is(&other_tenant_id)))
                     .and(locked.eq(Some(false)).or(expires_at.lt(now)))
                 ))
@@ -259,7 +273,7 @@ impl MutexRepository for OrmMutexRepository {
     ) -> LockResult<PaginatedResult<MutexLock>> {
         let mut conn = self.pool.get().map_err(|err|
             LockError::database(format!("failed to get pool connection due to {}", err).as_str(), None, true))?;
-        let offset: i64 = page_size as i64 * page.clone().unwrap_or_else(|| "0").parse().unwrap_or_else(|_| 0);
+        let offset: i64 = page_size as i64 * page.unwrap_or("0").parse().unwrap_or(0);
         match mutexes
             .filter(tenant_id.eq(&other_tenant_id.to_string()).or(tenant_id.is(&other_tenant_id.to_string())))
             .offset(offset)
@@ -282,7 +296,7 @@ impl MutexRepository for OrmMutexRepository {
     ) -> LockResult<PaginatedResult<MutexLock>> {
         let mut conn = self.pool.get().map_err(|err|
             LockError::database(format!("failed to get pool connection due to {}", err).as_str(), None, true))?;
-        let offset: i64 = page_size as i64 * page.clone().unwrap_or_else(|| "0").parse().unwrap_or_else(|_| 0);
+        let offset: i64 = page_size as i64 * page.unwrap_or("0").parse().unwrap_or(0);
         match mutexes
             .filter(
                 semaphore_key.eq(&other_semaphore_key)
@@ -297,6 +311,22 @@ impl MutexRepository for OrmMutexRepository {
             }
             Err(err) => { Err(LockError::from(err)) }
         }
+    }
+
+    async fn ping(&self) -> LockResult<()> {
+        if let Err(err) = self.find_by_tenant_id("test", None, 1).await {
+            match err {
+                LockError::AccessDenied { .. } => {
+                    return Err(err);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn eventually_consistent(&self) -> bool {
+        false
     }
 }
 

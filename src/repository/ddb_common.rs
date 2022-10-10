@@ -5,11 +5,12 @@ use aws_sdk_dynamodb::model::{AttributeDefinition, AttributeValue, GlobalSeconda
 use aws_sdk_dynamodb::types::SdkError;
 use serde_json::Value;
 
-use crate::domain::models::{LockError, LockResult, MutexLock, Semaphore};
+use crate::domain::models::{LockResult, MutexLock, Semaphore};
 use chrono::NaiveDateTime;
 use uuid::Uuid;
 use tokio::time::Duration;
 use aws_sdk_dynamodb::error::{DeleteItemError, PutItemError, QueryError, UpdateItemError};
+use crate::domain::error::LockError;
 
 const DEFAULT_LEASE_DURATION: i64 = 20000;
 
@@ -17,7 +18,7 @@ pub(crate) fn map_to_lock(map: &HashMap<String, AttributeValue>) -> LockResult<M
     Ok(MutexLock {
         mutex_key: parse_string_attribute("mutex_key", map)?,
         version: parse_opt_string_attribute("version", map).unwrap_or_else(|| Uuid::new_v4().to_string()),
-        lease_duration_ms: parse_opt_number_attribute("lease_duration_ms", map).unwrap_or_else(|| DEFAULT_LEASE_DURATION),
+        lease_duration_ms: parse_opt_number_attribute("lease_duration_ms", map).unwrap_or(DEFAULT_LEASE_DURATION),
         tenant_id: parse_string_attribute("tenant_id", map)?,
         semaphore_key: parse_opt_string_attribute("semaphore_key", map),
         data: parse_opt_string_attribute("data", map),
@@ -35,9 +36,10 @@ pub(crate) fn map_to_semaphore(map: &HashMap<String, AttributeValue>) -> LockRes
     Ok(Semaphore {
         semaphore_key: parse_string_attribute("semaphore_key", map)?,
         version: parse_opt_string_attribute("version", map).unwrap_or_else(|| Uuid::new_v4().to_string()),
-        data: parse_opt_string_attribute("data", map),
         tenant_id: parse_string_attribute("tenant_id", map)?,
         max_size: parse_number_attribute("max_size", map)? as i32,
+        busy_count: Option::from(parse_number_attribute("busy_count", map)? as i32),
+        fair_semaphore: parse_bool_attribute("fair_semaphore", map),
         lease_duration_ms: parse_number_attribute("lease_duration_ms", map)?,
         created_at: parse_date_attribute("created_at", map),
         created_by: parse_opt_string_attribute("created_by", map),
@@ -64,7 +66,7 @@ pub(crate) async fn describe_table(client: &Client, table_name: &str) -> LockRes
         }
         Err(err) => {
             if let SdkError::ServiceError { err, .. } = err {
-                let retryable = if let error::DescribeTableErrorKind::InternalServerError(_) = err.kind { true } else { false };
+                let retryable = matches!(err.kind, error::DescribeTableErrorKind::InternalServerError(_));
                 Err(LockError::database(
                     format!("failed to describe {} table due to {}",
                             table_name, err).as_str(), None, retryable))
@@ -144,7 +146,7 @@ pub(crate) async fn create_table(client: &Client, table_name: &str, key: &str, g
                 if let error::CreateTableErrorKind::ResourceInUseException(_) = err.kind {
                     Ok(())
                 } else {
-                    let retryable = if let error::CreateTableErrorKind::InternalServerError(_) = err.kind { true } else { false };
+                    let retryable = matches!(err.kind, error::CreateTableErrorKind::InternalServerError(_));
                     Err(LockError::database(
                         format!("failed to create {} table due to {}",
                                 table_name, err).as_str(), None, retryable))
@@ -170,7 +172,7 @@ pub(crate) async fn delete_table(client: &Client, table_name: &str) -> LockResul
                 if let error::DeleteTableErrorKind::ResourceNotFoundException(_) = err.kind {
                     Ok(())
                 } else {
-                    let retryable = if let error::DeleteTableErrorKind::InternalServerError(_) = err.kind { true } else { false };
+                    let retryable = matches!(err.kind, error::DeleteTableErrorKind::InternalServerError(_));
                     Err(LockError::database(
                         format!("failed to delete {} table due to {}",
                                 table_name, err).as_str(), None, retryable))
@@ -231,51 +233,41 @@ pub(crate) fn date_time_to_string(date: &NaiveDateTime) -> String {
 }
 
 fn parse_string_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> LockResult<String> {
-    if let Some(attr) = map.get(name) {
-        if let AttributeValue::S(str) = attr {
-            return Ok(str.clone());
-        }
+    if let Some(AttributeValue::S(str)) = map.get(name) {
+        return Ok(str.clone());
     }
     Err(LockError::validation(
         format!("no string value for {} in {:?}", name, map).as_str(), None))
 }
 
 fn parse_bool_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> Option<bool> {
-    if let Some(attr) = map.get(name) {
-        if let AttributeValue::Bool(b) = attr {
-            return Some(*b);
-        }
+    if let Some(AttributeValue::Bool(b)) = map.get(name) {
+        return Some(*b);
     }
     None
 }
 
 fn parse_opt_string_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> Option<String> {
-    if let Some(attr) = map.get(name) {
-        if let AttributeValue::S(str) = attr {
-            return Some(str.clone());
-        }
+    if let Some(AttributeValue::S(str)) = map.get(name) {
+        return Some(str.clone());
     }
     None
 }
 
 fn parse_date_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> Option<NaiveDateTime> {
-    if let Some(attr) = map.get(name) {
-        if let AttributeValue::S(str) = attr {
-            // e.g. 2022-09-24T04:40:35.726029
-            if let Ok(date) = NaiveDateTime::parse_from_str(str, "%Y-%m-%dT%H:%M:%S%.f") {
-                return Some(date);
-            }
+    if let Some(AttributeValue::S(str)) = map.get(name) {
+        // e.g. 2022-09-24T04:40:35.726029
+        if let Ok(date) = NaiveDateTime::parse_from_str(str, "%Y-%m-%dT%H:%M:%S%.f") {
+            return Some(date);
         }
     }
     None
 }
 
 fn parse_number_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> LockResult<i64> {
-    if let Some(attr) = map.get(name) {
-        if let AttributeValue::N(str) = attr {
-            if let Ok(n) = str.parse::<i64>() {
-                return Ok(n);
-            }
+    if let Some(AttributeValue::N(str)) = map.get(name) {
+        if let Ok(n) = str.parse::<i64>() {
+            return Ok(n);
         }
     }
     Err(LockError::validation(
@@ -283,11 +275,9 @@ fn parse_number_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> 
 }
 
 fn parse_opt_number_attribute(name: &str, map: &HashMap<String, AttributeValue>) -> Option<i64> {
-    if let Some(attr) = map.get(name) {
-        if let AttributeValue::N(str) = attr {
-            if let Ok(n) = str.parse::<i64>() {
-                return Some(n);
-            }
+    if let Some(AttributeValue::N(str)) = map.get(name) {
+        if let Ok(n) = str.parse::<i64>() {
+            return Some(n);
         }
     }
     None
@@ -321,10 +311,10 @@ impl std::convert::From<SdkError<UpdateItemError>> for LockError {
         let (retryable, reason) = retryable_sdk_error(&err);
         if retryable {
             LockError::unavailable(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, true)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, true)
         } else {
             LockError::database(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, false)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, false)
         }
     }
 }
@@ -334,10 +324,10 @@ impl std::convert::From<SdkError<PutItemError>> for LockError {
         let (retryable, reason) = retryable_sdk_error(&err);
         if retryable {
             LockError::unavailable(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, true)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, true)
         } else {
             LockError::database(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, false)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, false)
         }
     }
 }
@@ -347,10 +337,10 @@ impl std::convert::From<SdkError<DeleteItemError>> for LockError {
         let (retryable, reason) = retryable_sdk_error(&err);
         if retryable {
             LockError::unavailable(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, true)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, true)
         } else {
             LockError::database(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, false)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, false)
         }
     }
 }
@@ -360,13 +350,17 @@ impl std::convert::From<SdkError<QueryError>> for LockError {
         let (retryable, reason) = retryable_sdk_error(&err);
         if retryable {
             LockError::unavailable(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, true)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, true)
         } else if Some("404".to_string()) == reason {
             LockError::not_found(
                 format!("not found error {:?} {:?}", err, reason).as_str())
+        } else if Some("400 Bad Request".to_string()) == reason &&
+            err.to_string().as_str().contains("security token") {
+            LockError::access_denied(
+                format!("access-denied error {:?} {:?}", err, reason).as_str(), reason)
         } else {
             LockError::database(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, false)
+                format!("ddb database error {:?} {:?}", err, reason).as_str(), reason, false)
         }
     }
 }

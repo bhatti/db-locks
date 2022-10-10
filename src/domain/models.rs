@@ -1,27 +1,25 @@
-use std::{env, error::Error, fmt};
+use std::env;
 use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use std::fmt::Display;
 use std::hash::{Hash, Hasher};
-use std::ops::{Add};
-use std::path::PathBuf;
+use std::ops::Add;
+use clap::ValueEnum;
 
 use aws_sdk_dynamodb::model::AttributeValue;
 use chrono::{Duration, NaiveDateTime, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
 use diesel::prelude::*;
+use gethostname::gethostname;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use crate::domain::error::LockError;
+use crate::domain::options::{AcquireLockOptions, ReleaseLockOptions, SendHeartbeatOptions};
 
 use crate::domain::schema::*;
 use crate::utils;
 
-// Used as a default buffer for how long extra to wait when querying database for a
-// lock in acquireLock (can be overriden by specifying a timeout when calling acquireLock)
-const DEFAULT_BUFFER_MS: i64 = 1000;
-
 const DEFAULT_HEARTBEAT_PERIOD: i64 = 5000;
 
-const DEFAULT_LEASE_PERIOD: i64 = 15000;
+pub(crate) const DEFAULT_LEASE_PERIOD: i64 = 15000;
 
 pub(crate) const DEFAULT_SEMAPHORE_KEY: &str = "DEFAULT";
 
@@ -34,12 +32,9 @@ pub enum RepositoryProvider {
 
 impl PartialEq for RepositoryProvider {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (RepositoryProvider::Rdb, RepositoryProvider::Rdb) => { true }
-            (RepositoryProvider::Ddb, RepositoryProvider::Ddb) => { true }
-            (RepositoryProvider::Redis, RepositoryProvider::Redis) => { true }
-            _ => false
-        }
+        matches!((self, other), (RepositoryProvider::Rdb, RepositoryProvider::Rdb) |
+            (RepositoryProvider::Ddb, RepositoryProvider::Ddb) |
+            (RepositoryProvider::Redis, RepositoryProvider::Redis))
     }
 }
 
@@ -77,137 +72,6 @@ impl std::fmt::Display for RepositoryProvider {
     }
 }
 
-//
-#[derive(Debug)]
-pub enum LockError {
-    Database {
-        message: String,
-        reason_code: Option<String>,
-        retryable: bool,
-    },
-    NotGranted {
-        message: String,
-        reason_code: Option<String>,
-    },
-    NotFound {
-        message: String,
-    },
-
-    // This is a retry-able error, which indicates that the lock being requested has already been
-    // held by another worker and has not been released yet and the lease duration has not expired
-    // since the lock was last updated by the current tenant_id.
-    // The caller can retry acquiring the lock with or without a backoff.
-    CurrentlyUnavailable {
-        message: String,
-        reason_code: Option<String>,
-        retryable: bool,
-    },
-    Validation {
-        message: String,
-        reason_code: Option<String>,
-    },
-    Serialization {
-        message: String,
-    },
-    Runtime {
-        message: String,
-        reason_code: Option<String>,
-    },
-}
-
-impl LockError {
-    pub fn database(message: &str, reason_code: Option<String>, retryable: bool) -> LockError {
-        LockError::Database { message: message.to_string(), reason_code, retryable }
-    }
-
-    pub fn not_granted(message: &str, reason_code: Option<String>) -> LockError {
-        LockError::NotGranted { message: message.to_string(), reason_code }
-    }
-
-    pub fn not_found(message: &str) -> LockError {
-        LockError::NotFound { message: message.to_string() }
-    }
-
-    pub fn unavailable(message: &str, reason_code: Option<String>, retryable: bool) -> LockError {
-        LockError::CurrentlyUnavailable { message: message.to_string(), reason_code, retryable }
-    }
-
-    pub fn validation(message: &str, reason_code: Option<String>) -> LockError {
-        LockError::Validation { message: message.to_string(), reason_code }
-    }
-
-    pub fn serialization(message: &str) -> LockError {
-        LockError::Serialization { message: message.to_string() }
-    }
-
-    pub fn runtime(message: &str, reason_code: Option<String>) -> LockError {
-        LockError::Runtime { message: message.to_string(), reason_code }
-    }
-
-    pub fn retryable(&self) -> bool {
-        match self {
-            LockError::Database { retryable, .. } => { *retryable }
-            LockError::NotGranted { .. } => { false }
-            LockError::NotFound { .. } => { false }
-            LockError::CurrentlyUnavailable { retryable, .. } => { *retryable }
-            LockError::Validation { .. } => { false }
-            LockError::Serialization { .. } => { false }
-            LockError::Runtime { .. } => { false }
-        }
-    }
-}
-
-impl std::convert::From<std::io::Error> for LockError {
-    fn from(err: std::io::Error) -> Self {
-        LockError::runtime(
-            format!("serde validation {:?}", err).as_str(), None)
-    }
-}
-
-impl std::convert::From<serde_json::Error> for LockError {
-    fn from(err: serde_json::Error) -> Self {
-        LockError::serialization(
-            format!("serde validation {:?}", err).as_str())
-    }
-}
-
-impl std::convert::From<prometheus::Error> for LockError {
-    fn from(err: prometheus::Error) -> Self {
-        LockError::validation(
-            format!("prometheus validation {:?}", err).as_str(), None)
-    }
-}
-
-impl Display for LockError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            LockError::Database { message, reason_code, retryable } => {
-                write!(f, "{} {:?} {}", message, reason_code, retryable)
-            }
-            LockError::NotGranted { message, reason_code } => {
-                write!(f, "{} {:?}", message, reason_code)
-            }
-            LockError::NotFound { message } => {
-                write!(f, "{}", message)
-            }
-            LockError::CurrentlyUnavailable { message, reason_code, retryable } => {
-                write!(f, "{} {:?} {}", message, reason_code, retryable)
-            }
-            LockError::Validation { message, reason_code } => {
-                write!(f, "{} {:?}", message, reason_code)
-            }
-            LockError::Serialization { message } => {
-                write!(f, "{}", message)
-            }
-            LockError::Runtime { message, reason_code } => {
-                write!(f, "{} {:?}", message, reason_code)
-            }
-        }
-    }
-}
-
-impl Error for LockError {}
-
 /// A specialized Result type for Lock Result.
 pub type LockResult<T> = Result<T, LockError>;
 
@@ -232,9 +96,21 @@ impl<T> PaginatedResult<T> {
         page: Option<&str>,
         page_size: usize,
         records: Vec<T>) -> Self {
-        let page_num: usize = page.clone().unwrap_or_else(|| "0").parse().unwrap_or_else(|_| 0);
+        let page_num: usize = page.unwrap_or("0").parse().unwrap_or(0);
         let next_page = if records.len() < page_size { None } else { Some((page_num + 1).to_string()) };
         PaginatedResult::new(page, next_page, page_size, 0, records)
+    }
+
+    pub fn from_redis(
+        next_token: &str,
+        page: Option<&str>,
+        page_size: usize,
+        records: Vec<T>) -> Self {
+        if page != None && next_token == "0" {
+            PaginatedResult::new(page, Some("-1".to_string()), page_size, 0, records)
+        } else {
+            PaginatedResult::new(page, Some(next_token.to_string()), page_size, 0, records)
+        }
     }
 
     pub fn to_ddb_page(tenant_id: &str, page: Option<&str>) -> Option<HashMap<String, AttributeValue>> {
@@ -345,7 +221,7 @@ impl MutexLock {
             locked: Some(true),
             lease_duration_ms: options.lease_duration_ms,
             expires_at: Some(Utc::now().naive_utc().add(Duration::milliseconds(options.lease_duration_ms))),
-            created_at: self.created_at.clone(),
+            created_at: self.created_at,
             created_by: self.created_by.clone(),
             updated_at: Some(Utc::now().naive_utc()),
             updated_by: Some(String::from("")),
@@ -365,23 +241,42 @@ impl MutexLock {
         self.expires_at = Some(Utc::now().naive_utc().add(Duration::milliseconds(options.lease_duration_to_ensure_ms)));
     }
 
-    pub fn expired(self: &Self) -> bool {
-        if let (Some(locked), Some(expires_at)) = (self.locked, self.expires_at) {
-            !locked || expires_at.timestamp_millis() < utils::current_time_ms()
-        } else {
-            false
+    pub fn locked_clone(&self) -> Self {
+        MutexLock {
+            mutex_key: self.mutex_key.clone(),
+            tenant_id: self.tenant_id.clone(),
+            version: self.version.clone(),
+            semaphore_key: self.semaphore_key.clone(),
+            data: self.data.clone(),
+            delete_on_release: self.delete_on_release,
+            locked: Some(true),
+            lease_duration_ms: self.lease_duration_ms,
+            expires_at: Some(Utc::now().naive_utc().add(Duration::milliseconds(self.lease_duration_ms))),
+            created_at: self.created_at,
+            created_by: self.created_by.clone(),
+            updated_at: Some(Utc::now().naive_utc()),
+            updated_by: Some(String::from("")),
         }
+    }
+
+
+    pub fn get_lease_duration_secs(&self) -> usize {
+        (self.lease_duration_ms / 1000) as usize
+    }
+
+    pub fn expired(&self) -> bool {
+        if let (Some(locked), Some(expires_at)) = (self.locked, self.expires_at) {
+            return !locked || expires_at.timestamp_millis() < utils::current_time_ms();
+        }
+        self.locked == None || self.expires_at == None
     }
 
     pub fn key_rank(&self) -> Option<i32> {
         if self.semaphore_key != None {
             let parts: Vec<&str> = self.mutex_key.split('_').collect();
             if parts.len() > 1 {
-                match parts[parts.len() - 1].parse() {
-                    Ok(n) => {
-                        return Some(n);
-                    }
-                    Err(_) => {}
+                if let Ok(n) = parts[parts.len() - 1].parse() {
+                    return Some(n);
                 }
             }
         }
@@ -408,7 +303,11 @@ impl MutexLock {
     }
 
     pub fn full_key(&self) -> String {
-        format!("{}_{}", self.mutex_key, self.tenant_id)
+        MutexLock::build_full_key(self.mutex_key.as_str(), self.tenant_id.as_str())
+    }
+
+    pub fn build_full_key(other_key: &str, other_tenant_key: &str) -> String {
+        format!("{}_{}", other_key, other_tenant_key)
     }
 
     pub fn expires_at_string(&self) -> String {
@@ -427,7 +326,7 @@ impl MutexLock {
 
     pub fn belongs_to_semaphore(&self) -> bool {
         if let Some(sem_key) = &self.semaphore_key {
-            return sem_key.as_str() != DEFAULT_SEMAPHORE_KEY && sem_key.as_str() != "";
+            return !Semaphore::is_default_semaphore(sem_key.as_str());
         }
         false
     }
@@ -448,8 +347,10 @@ pub struct Semaphore {
     pub max_size: i32,
     // How long the lease for the lock is (in milliseconds)
     pub lease_duration_ms: i64,
-    // The data stored in the lock (can be empty)
-    pub data: Option<String>,
+    // Number of busy locks
+    pub busy_count: Option<i32>,
+    // fair semaphore lock
+    pub fair_semaphore: Option<bool>,
     pub created_by: Option<String>,
     pub created_at: Option<NaiveDateTime>,
     pub updated_by: Option<String>,
@@ -462,25 +363,34 @@ impl Semaphore {
             semaphore_key: self.semaphore_key.clone(),
             tenant_id: tenant_id.to_string(),
             version: self.version.clone(),
-            data: other.data.clone(),
             max_size: other.max_size,
             lease_duration_ms: other.lease_duration_ms,
-            created_at: other.created_at.clone(),
+            busy_count: other.busy_count,
+            fair_semaphore: None,
+            created_at: other.created_at,
             created_by: other.created_by.clone(),
             updated_at: Some(Utc::now().naive_utc()),
             updated_by: Some(String::from("")),
         }
     }
 
-    fn to_lock(&self, rank: i32, tenant_id: &str) -> MutexLock {
-        let key = format!("{}_{:0width$}", self.semaphore_key, rank, width = 10);
+    pub(crate) fn build_key_rank(key: &str, rank: i32) -> String {
+        format!("{}_{:0width$}", key, rank, width = 10)
+    }
+
+    pub fn is_default_semaphore(sem_key: &str) -> bool {
+        sem_key == DEFAULT_SEMAPHORE_KEY || sem_key.is_empty()
+    }
+
+    fn to_mutex_with_rank(&self, rank: i32, tenant_id: &str) -> MutexLock {
+        let key = Semaphore::build_key_rank(self.semaphore_key.as_str(), rank);
         MutexLock {
             mutex_key: key,
             tenant_id: tenant_id.to_string(),
             version: Uuid::new_v4().to_string(),
             lease_duration_ms: self.lease_duration_ms,
             semaphore_key: Some(self.semaphore_key.clone()),
-            data: self.data.clone(),
+            data: None,
             delete_on_release: Some(false),
             locked: Some(false),
             expires_at: Some(Utc::now().naive_utc().add(Duration::milliseconds(self.lease_duration_ms))),
@@ -491,14 +401,39 @@ impl Semaphore {
         }
     }
 
+    pub(crate) fn to_mutex_with_key_version(&self, key: &str, version: &str, locked: bool) -> MutexLock {
+        MutexLock {
+            mutex_key: key.to_string(),
+            tenant_id: self.tenant_id.to_string(),
+            version: version.to_string(),
+            lease_duration_ms: self.lease_duration_ms,
+            semaphore_key: Some(self.semaphore_key.clone()),
+            data: None,
+            delete_on_release: Some(false),
+            locked: Some(locked),
+            expires_at: Some(Utc::now().naive_utc().add(Duration::milliseconds(self.lease_duration_ms))),
+            created_at: Some(Utc::now().naive_utc()),
+            created_by: Some(String::from("")),
+            updated_at: Some(Utc::now().naive_utc()),
+            updated_by: Some(String::from("")),
+        }
+    }
+
     pub fn generate_mutexes(&self, from: i32) -> Vec<MutexLock> {
-        let items = (from..self.max_size).map(|i| self.to_lock(i, self.tenant_id.as_str())).collect();
-        items
+        (from..self.max_size).map(|i| self.to_mutex_with_rank(i, self.tenant_id.as_str())).collect()
     }
 
     pub fn updated_at_string(&self) -> String {
         let date = self.updated_at.unwrap_or_else(|| NaiveDateTime::from_timestamp(0, 0));
         date.format("%Y-%m-%dT%H:%M:%S%.f").to_string()
+    }
+
+    pub fn is_fair_semaphore(&self) -> bool {
+        self.fair_semaphore.unwrap_or(false)
+    }
+
+    pub fn full_key(&self) -> String {
+        MutexLock::build_full_key(self.semaphore_key.as_str(), self.tenant_id.as_str())
     }
 }
 
@@ -516,8 +451,9 @@ impl Hash for Semaphore {
 
 impl Display for Semaphore {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "key={} version={} tenant_id={}, lease_duration_ms={}",
-               self.semaphore_key, self.version, self.tenant_id, self.lease_duration_ms)
+        write!(f, "key={} version={} tenant_id={}, lease_duration_ms={}, max_size={}, busy={:?}, fair={:?}",
+               self.semaphore_key, self.version, self.tenant_id,
+               self.lease_duration_ms, self.max_size, self.busy_count, self.fair_semaphore)
     }
 }
 
@@ -525,32 +461,33 @@ impl Display for Semaphore {
 pub struct SemaphoreBuilder {
     // The key representing the semaphore
     pub semaphore_key: String,
-    // The data stored in the lock (can be empty)
-    pub data: Option<String>,
     // Whether the item in database is marked as locked
     pub max_size: i32,
     // How long the lease for the lock is (in milliseconds)
     pub lease_duration_ms: i64,
+    // fair semaphore lock
+    pub fair_semaphore: Option<bool>,
 }
 
 impl SemaphoreBuilder {
     pub fn new(key: &str, max_size: i32) -> Self {
         SemaphoreBuilder {
             semaphore_key: key.to_string(),
-            data: None,
             max_size,
             lease_duration_ms: DEFAULT_LEASE_PERIOD,
+            fair_semaphore: None,
         }
     }
 
     pub fn build(&self) -> Semaphore {
         Semaphore {
             semaphore_key: self.semaphore_key.clone(),
-            tenant_id: "".to_string(),
+            tenant_id: get_default_tenant(),
             version: Uuid::new_v4().to_string(),
             max_size: self.max_size,
             lease_duration_ms: self.lease_duration_ms,
-            data: self.data.clone(),
+            busy_count: None,
+            fair_semaphore: self.fair_semaphore,
             created_at: Some(Utc::now().naive_utc()),
             created_by: Some(String::from("")),
             updated_at: Some(Utc::now().naive_utc()),
@@ -573,13 +510,9 @@ impl SemaphoreBuilder {
         self
     }
 
-    pub fn with_opt_data(&mut self, data: &Option<String>) -> &mut Self {
-        self.data = data.as_ref().map(|d| d.clone());
-        self
-    }
-
-    pub fn with_data(&mut self, data: &str) -> &mut Self {
-        self.data = Some(data.to_string());
+    // fair semaphore lock
+    pub fn with_fair_semaphore(&mut self, fair_semaphore: bool) -> &mut Self {
+        self.fair_semaphore = Some(fair_semaphore);
         self
     }
 }
@@ -594,18 +527,25 @@ pub struct LocksConfig {
     // heartbeat_period_ms = 1000, lease_duration_ms=10000 could be a reasonable configuration,
     // make sure to include a buffer for network latency.
     pub heartbeat_period_ms: Option<i64>,
-    // The name of table for locks_table when using DDB or Redis
-    pub locks_table_name: Option<String>,
-    // The name of table for semaphores_table when using DDB or Redis
+    // The name of table for mutexes when using DDB or Redis
+    pub mutexes_table_name: Option<String>,
+    // The name of table for semaphores when using DDB or Redis
     pub semaphores_table_name: Option<String>,
 
-    pub use_cache: Option<bool>,
+    pub fair_semaphore: Option<bool>,
+
+    pub cache_enabled: Option<bool>,
 
     // The max size of semaphores
-    pub max_semaphore_size: Option<usize>,
+    pub max_semaphore_size: Option<i32>,
 
     // database-url for diesel
     pub database_url: Option<String>,
+
+    // redis url, e.g. redis://127.0.0.1 or rediss://127.0.0.1/
+    // redis://:password@127.0.0.1:6379
+    // cluster not supported but you will need to specify list of ip-addresses
+    pub redis_url: Option<String>,
 
     // database-pool-size for diesel
     pub database_pool_size: Option<u32>,
@@ -632,11 +572,13 @@ impl LocksConfig {
         LocksConfig {
             tenant_id: Some(tenant_id.to_string()),
             heartbeat_period_ms: None,
-            locks_table_name: None,
+            mutexes_table_name: None,
             semaphores_table_name: None,
-            use_cache: None,
+            fair_semaphore: None,
+            cache_enabled: None,
             max_semaphore_size: None,
             database_url: None,
+            redis_url: None,
             database_pool_size: None,
             run_database_migrations: Some(true),
             aws_region: None,
@@ -651,11 +593,15 @@ impl LocksConfig {
     }
 
     pub fn should_run_database_migrations(&self) -> bool {
-        self.run_database_migrations.unwrap_or_else(|| false)
+        self.run_database_migrations.unwrap_or(false)
     }
 
-    pub fn should_use_cache(&self) -> bool {
-        self.use_cache.unwrap_or_else(|| true)
+    pub fn is_cache_enabled(&self) -> bool {
+        self.cache_enabled.unwrap_or(true)
+    }
+
+    pub fn is_fair_semaphore(&self) -> bool {
+        self.fair_semaphore.unwrap_or(false)
     }
 
     pub fn get_database_url(&self) -> String {
@@ -663,23 +609,27 @@ impl LocksConfig {
     }
 
     pub fn get_database_pool_size(&self) -> u32 {
-        self.database_pool_size.unwrap_or_else(|| 32)
+        self.database_pool_size.unwrap_or(32)
     }
 
-    pub fn get_max_semaphore_size(&self) -> usize {
-        self.max_semaphore_size.unwrap_or_else(|| 1000)
+    pub fn get_max_semaphore_size(&self) -> i32 {
+        self.max_semaphore_size.unwrap_or(1000)
     }
 
     pub fn get_heartbeat_period_ms(&self) -> i64 {
-        self.heartbeat_period_ms.unwrap_or_else(|| DEFAULT_HEARTBEAT_PERIOD)
+        self.heartbeat_period_ms.unwrap_or(DEFAULT_HEARTBEAT_PERIOD)
     }
 
-    pub fn get_locks_table_name(&self) -> String {
-        self.locks_table_name.clone().unwrap_or_else(|| "mutexes".to_string())
+    pub fn get_mutexes_table_name(&self) -> String {
+        self.mutexes_table_name.clone().unwrap_or_else(|| "mutexes".to_string())
+    }
+
+    pub fn get_redis_url(&self) -> String {
+        self.redis_url.clone().unwrap_or_else(|| env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1".to_string()))
     }
 
     pub fn get_semaphores_table_name(&self) -> String {
-        self.locks_table_name.clone().unwrap_or_else(|| "semaphores".to_string())
+        self.mutexes_table_name.clone().unwrap_or_else(|| "semaphores".to_string())
     }
 
     pub fn get_aws_region(&self) -> String {
@@ -687,695 +637,25 @@ impl LocksConfig {
     }
 
     pub fn has_ddb_read_consistency(&self) -> bool {
-        self.ddb_read_consistency.unwrap_or_else(|| true)
+        self.ddb_read_consistency.unwrap_or(true)
     }
 
     pub fn get_server_error_retries_limit(&self) -> u32 {
-        self.server_error_retries_limit.unwrap_or_else(|| 20)
+        self.server_error_retries_limit.unwrap_or(20)
     }
 
     pub fn get_wait_before_server_error_retries_ms(&self) -> u64 {
-        self.wait_before_server_error_retries_ms.unwrap_or_else(|| 250)
+        self.wait_before_server_error_retries_ms.unwrap_or(250)
     }
 }
 
-/// AcquireLockOptions defines abstraction for acquiring lock
-#[derive(Debug, Clone, Serialize, Deserialize, Eq)]
-pub struct AcquireLockOptions {
-    // The key representing the lock
-    pub key: String,
-    // How long the lease for the lock is (in milliseconds)
-    pub lease_duration_ms: i64,
-    // The data to be stored alongside the lock (can be empty)
-    // It can be null if no data is needed to be stored there. If null
-    // with replace_data = true, the data will be removed.
-    pub data: Option<String>,
-    // Whether or not to replace data when acquiring lock that already exists in the database
-    pub replace_data: Option<bool>,
-    // Whether or not to delete the lock item when releasing it
-    pub delete_on_release: Option<bool>,
-    // If reentrant is set to true, the lock client will check first if it already owns the lock.
-    // If it already owns the lock and the lock is not expired, it will return the lock immediately.
-    // If this is set to false and the client already owns the lock, the call to acquireLock will block.
-    pub reentrant: Option<bool>,
-    // The acquire_only_if_already_exists whether or not to allow acquiring locks if the lock
-    // does not exist already.
-    pub acquire_only_if_already_exists: Option<bool>,
-    // How long to wait before trying to get the lock again.
-    pub refresh_period_ms: Option<i64>,
-    //  How long to wait in addition to the lease duration.
-    pub additional_time_to_wait_for_lock_ms: Option<i64>,
-    //  Override time to wait to the lease duration.
-    pub override_time_to_wait_for_lock_ms: Option<i64>,
-    // The lock uses semaphore
-    pub requires_semaphore: Option<bool>,
-}
-
-impl PartialEq for AcquireLockOptions {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Hash for AcquireLockOptions {
-    fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.key.hash(hasher);
-    }
-}
-
-impl Display for AcquireLockOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.key)
-    }
-}
-
-impl AcquireLockOptions {
-    pub fn to_unlocked_mutex(&self, tenant_id: &str) -> MutexLock {
-        MutexLock {
-            mutex_key: self.key.clone(),
-            tenant_id: tenant_id.to_string(),
-            version: Uuid::new_v4().to_string(),
-            semaphore_key: if self.does_use_semaphore() { Some(self.key.clone()) } else { Some(DEFAULT_SEMAPHORE_KEY.to_string()) },
-            data: self.data.clone(),
-            delete_on_release: self.delete_on_release,
-            locked: Some(false),
-            lease_duration_ms: self.lease_duration_ms,
-            expires_at: Some(Utc::now().naive_utc().add(Duration::milliseconds(self.lease_duration_ms))),
-            created_at: Some(Utc::now().naive_utc()),
-            created_by: Some(String::from("")),
-            updated_at: Some(Utc::now().naive_utc()),
-            updated_by: Some(String::from("")),
-        }
-    }
-
-    pub fn to_semaphore(&self, tenant_id: &str, max_size: i32) -> Semaphore {
-        Semaphore {
-            semaphore_key: self.key.clone(),
-            tenant_id: tenant_id.to_string(),
-            version: Uuid::new_v4().to_string(),
-            data: self.data.clone(),
-            max_size,
-            lease_duration_ms: self.lease_duration_ms,
-            created_at: Some(Utc::now().naive_utc()),
-            created_by: Some(String::from("")),
-            updated_at: Some(Utc::now().naive_utc()),
-            updated_by: Some(String::from("")),
-        }
-    }
-
-    pub fn to_locked_mutex(&self, tenant_id: &str) -> MutexLock {
-        MutexLock {
-            mutex_key: self.key.clone(),
-            tenant_id: tenant_id.to_string(),
-            version: Uuid::new_v4().to_string(),
-            lease_duration_ms: self.lease_duration_ms,
-            semaphore_key: if self.does_use_semaphore() { Some(self.key.clone()) } else { Some(DEFAULT_SEMAPHORE_KEY.to_string()) },
-            data: self.data.clone(),
-            delete_on_release: self.delete_on_release,
-            locked: Some(true),
-            expires_at: Some(Utc::now().naive_utc().add(Duration::milliseconds(self.lease_duration_ms))),
-            created_at: Some(Utc::now().naive_utc()),
-            created_by: Some(String::from("")),
-            updated_at: Some(Utc::now().naive_utc()),
-            updated_by: Some(String::from("")),
-        }
-    }
-
-    pub fn is_replace_data(&self) -> bool {
-        self.replace_data.unwrap_or_else(|| false)
-    }
-
-    pub fn is_acquire_only_if_already_exists(&self) -> bool {
-        self.requires_semaphore.unwrap_or_else(|| false) || self.acquire_only_if_already_exists.unwrap_or_else(|| false)
-    }
-
-    pub fn get_additional_time_to_wait_for_lock_ms(&self) -> i64 {
-        self.additional_time_to_wait_for_lock_ms.unwrap_or_else(|| 100)
-    }
-
-    pub fn get_override_time_to_wait_for_lock_ms(&self) -> i64 {
-        self.override_time_to_wait_for_lock_ms.unwrap_or_else(|| self.lease_duration_ms)
-    }
-
-    pub fn get_refresh_period_ms(&self) -> i64 {
-        self.refresh_period_ms.unwrap_or_else(|| DEFAULT_BUFFER_MS)
-    }
-
-    pub fn does_use_semaphore(&self) -> bool {
-        self.requires_semaphore.unwrap_or_else(|| false)
-    }
-
-    pub fn is_reentrant(&self) -> bool {
-        self.reentrant.unwrap_or_else(|| false)
-    }
-}
-
-/// AcquireLockOptionsBuilder builds AcquireLockOptions
-#[derive(Debug, Clone)]
-pub struct AcquireLockOptionsBuilder {
-    // The key representing the lock
-    pub key: String,
-    // The data to be stored alongside the lock (can be empty)
-    // It can be null if no data is needed to be stored there. If null
-    // with replace_data = true, the data will be removed.
-    pub data: Option<String>,
-    // Whether or not to replace data when acquiring lock that already exists in the database
-    pub replace_data: Option<bool>,
-    // Whether or not to delete the lock item when releasing it
-    pub delete_on_release: Option<bool>,
-    // How long the lease for the lock is (in milliseconds)
-    pub lease_duration_ms: i64,
-    // If reentrant is set to true, the lock client will check first if it already owns the lock.
-    // If it already owns the lock and the lock is not expired, it will return the lock immediately.
-    // If this is set to false and the client already owns the lock, the call to acquireLock will block.
-    pub reentrant: Option<bool>,
-    // The acquire_only_if_already_exists whether or not to allow acquiring locks if the lock
-    // does not exist already.
-    pub acquire_only_if_already_exists: Option<bool>,
-    // How long to wait before trying to get the lock again.
-    pub refresh_period_ms: Option<i64>,
-    //  How long to wait in addition to the lease duration.
-    pub additional_time_to_wait_for_lock_ms: Option<i64>,
-    //  How long to wait to the lease duration.
-    pub override_time_to_wait_for_lock_ms: Option<i64>,
-    // The lock uses semaphore
-    pub requires_semaphore: Option<bool>,
-}
-
-impl Display for AcquireLockOptionsBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.key)
-    }
-}
-
-impl AcquireLockOptionsBuilder {
-    pub fn new(key: &str) -> Self {
-        AcquireLockOptionsBuilder {
-            key: key.to_string(),
-            data: None,
-            replace_data: None,
-            delete_on_release: None,
-            lease_duration_ms: DEFAULT_LEASE_PERIOD,
-            reentrant: None,
-            acquire_only_if_already_exists: None,
-            refresh_period_ms: None,
-            additional_time_to_wait_for_lock_ms: None,
-            override_time_to_wait_for_lock_ms: None,
-            requires_semaphore: None,
-        }
-    }
-
-    pub fn build(&self) -> AcquireLockOptions {
-        AcquireLockOptions {
-            key: self.key.clone(),
-            data: self.data.clone(),
-            replace_data: self.replace_data,
-            delete_on_release: self.delete_on_release,
-            lease_duration_ms: self.lease_duration_ms,
-            reentrant: self.reentrant,
-            acquire_only_if_already_exists: self.acquire_only_if_already_exists,
-            refresh_period_ms: self.refresh_period_ms,
-            additional_time_to_wait_for_lock_ms: self.additional_time_to_wait_for_lock_ms,
-            override_time_to_wait_for_lock_ms: self.override_time_to_wait_for_lock_ms,
-            requires_semaphore: self.requires_semaphore,
-        }
-    }
-
-    pub fn with_lease_duration_millis(&mut self, val: i64) -> &mut Self {
-        self.lease_duration_ms = val;
-        self
-    }
-
-    pub fn with_lease_duration_secs(&mut self, val: i64) -> &mut Self {
-        self.lease_duration_ms = val * 1000;
-        self
-    }
-
-    pub fn with_lease_duration_minutes(&mut self, val: i64) -> &mut Self {
-        self.lease_duration_ms = val * 1000 * 60;
-        self
-    }
-
-    pub fn with_data(&mut self, data: &str) -> &mut Self {
-        self.data = Some(data.to_string());
-        self
-    }
-
-    pub fn with_opt_data(&mut self, data: &Option<String>) -> &mut Self {
-        self.data = data.as_ref().map(|d| d.clone());
-        self
-    }
-
-    pub fn with_replace_data(&mut self, replace_data: bool) -> &mut Self {
-        self.replace_data = Some(replace_data);
-        self
-    }
-
-    pub fn with_delete_on_release(&mut self, delete_on_release: bool) -> &mut Self {
-        self.delete_on_release = Some(delete_on_release);
-        self
-    }
-
-    pub fn with_reentrant(&mut self, reentrant: bool) -> &mut Self {
-        self.reentrant = Some(reentrant);
-        self
-    }
-
-    pub fn with_acquire_only_if_already_exists(&mut self, acquire_only_if_already_exists: bool) -> &mut Self {
-        self.acquire_only_if_already_exists = Some(acquire_only_if_already_exists);
-        self
-    }
-
-    pub fn with_refresh_period_ms(&mut self, refresh_period_ms: i64) -> &mut Self {
-        self.refresh_period_ms = Some(refresh_period_ms);
-        self
-    }
-
-    pub fn with_additional_time_to_wait_for_lock_ms(&mut self, additional_time_to_wait_for_lock_ms: i64) -> &mut Self {
-        self.additional_time_to_wait_for_lock_ms = Some(additional_time_to_wait_for_lock_ms);
-        self
-    }
-    pub fn with_override_time_to_wait_for_lock_ms(&mut self, override_time_to_wait_for_lock_ms: i64) -> &mut Self {
-        self.override_time_to_wait_for_lock_ms = Some(override_time_to_wait_for_lock_ms);
-        self
-    }
-    pub fn with_requires_semaphore(&mut self, requires_semaphore: bool) -> &mut Self {
-        self.requires_semaphore = Some(requires_semaphore);
-        self
-    }
-}
-
-
-// Provides options for releasing a lock when calling the release_lock() method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReleaseLockOptions {
-    // The key representing the lock
-    pub key: String,
-
-    // record version of the lock in database. This is what tells the lock client when the lock is stale.
-    pub version: String,
-
-    // Whether or not to delete the lock when releasing it. If set to false, the
-    //  lock row will continue to be in database, but it will be marked as released.
-    pub delete_lock: Option<bool>,
-
-    // Optional link to the semaphore for multiple resource locks
-    pub semaphore_key: Option<String>,
-
-    // New data to persist to the lock (only used if delete_ock=false.) If the
-    // data is null, then the lock client will keep the data as-is and not change it.
-    pub data: Option<String>,
-}
-
-impl ReleaseLockOptions {
-    pub fn new(
-        key: &str,
-        version: &str,
-        delete_lock: Option<bool>,
-        semaphore_key: Option<String>,
-        data: Option<String>) -> Self {
-        ReleaseLockOptions {
-            key: key.to_string(),
-            version: version.to_string(),
-            delete_lock,
-            semaphore_key,
-            data,
-        }
-    }
-
-    pub fn is_delete_lock(&self) -> bool {
-        self.delete_lock.unwrap_or_else(|| false)
-    }
-
-    pub fn get_semaphore_key(&self) -> String {
-        self.semaphore_key.clone().unwrap_or_else(|| DEFAULT_SEMAPHORE_KEY.to_string())
-    }
-
-    pub fn data_or(&self, other: &MutexLock) -> Option<String> {
-        let mut data = other.data.clone();
-        if self.data != None {
-            data = self.data.clone();
-        }
-        data
-    }
-}
-
-/// ReleaseLockOptionsBuilder builds ReleaseLockOptions
-#[derive(Debug, Clone)]
-pub struct ReleaseLockOptionsBuilder {
-    // The key representing the lock
-    pub key: String,
-
-    // record version of the lock in database. This is what tells the lock client when the lock is stale.
-    pub version: String,
-
-    // Whether or not to delete the lock item when releasing it
-    pub delete_lock: Option<bool>,
-
-    // Optional link to the semaphore for multiple resource locks
-    pub semaphore_key: Option<String>,
-
-    // The data to be stored alongside the lock (can be empty)
-    // It can be null if no data is needed to be stored there. If null
-    // with replace_data = true, the data will be removed.
-    pub data: Option<String>,
-
-}
-
-impl ReleaseLockOptionsBuilder {
-    pub fn new(key: &str, version: &str) -> Self {
-        ReleaseLockOptionsBuilder {
-            key: key.to_string(),
-            version: version.to_string(),
-            delete_lock: None,
-            semaphore_key: None,
-            data: None,
-        }
-    }
-
-    pub fn build(&self) -> ReleaseLockOptions {
-        ReleaseLockOptions {
-            key: self.key.clone(),
-            version: self.version.clone(),
-            delete_lock: self.delete_lock,
-            semaphore_key: self.semaphore_key.clone(),
-            data: self.data.clone(),
-        }
-    }
-
-    pub fn with_delete_lock(&mut self, delete_lock: bool) -> &mut Self {
-        self.delete_lock = Some(delete_lock);
-        self
-    }
-
-    pub fn with_semaphore_key(&mut self, semaphore_key: &str) -> &mut Self {
-        self.semaphore_key = Some(semaphore_key.to_string());
-        self
-    }
-
-    pub fn with_opt_semaphore_key(&mut self, semaphore_key: &Option<String>) -> &mut Self {
-        self.semaphore_key = semaphore_key.as_ref().map(|k| k.clone());
-        self
-    }
-
-    pub fn with_data(&mut self, data: &str) -> &mut Self {
-        self.data = Some(data.to_string());
-        self
-    }
-
-    pub fn with_opt_data(&mut self, data: &Option<String>) -> &mut Self {
-        self.data = data.as_ref().map(|d| d.clone());
-        self
-    }
-}
-
-
-// Provides options for deleting locks or semaphores
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeleteLockOptions {
-    // The key representing the lock
-    pub key: String,
-
-    // record version of the lock in database. This is what tells the lock client when the lock is stale.
-    pub version: String,
-}
-
-// It defines abstraction for sending lock heartbeats or updating the lock data with
-// various combinations of overrides of the default behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SendHeartbeatOptions {
-    // The key representing the lock
-    pub key: String,
-    // record version of the lock in database. This is what tells the lock client when the lock is stale.
-    pub version: String,
-    // The delete_data is true if the extra data associated with the lock should be deleted.
-    // Must be null or false if data is non-null.
-    pub delete_data: Option<bool>,
-    // The new duration of the lease after the heartbeat is sent
-    pub lease_duration_to_ensure_ms: i64,
-
-    // Optional link to the semaphore for multiple resource locks
-    pub semaphore_key: Option<String>,
-
-    // New data to update in the lock item. If null, will delete the data from the item.
-    pub data: Option<String>,
-}
-
-impl SendHeartbeatOptions {
-    pub fn new(
-        key: &str,
-        version: &str,
-        delete_data: Option<bool>,
-        lease_duration_to_ensure_ms: i64,
-        semaphore_key: Option<String>,
-        data: Option<String>) -> Self {
-        SendHeartbeatOptions {
-            key: key.to_string(),
-            version: version.to_string(),
-            delete_data,
-            lease_duration_to_ensure_ms,
-            semaphore_key,
-            data,
-        }
-    }
-
-    pub fn get_semaphore_key(&self) -> String {
-        self.semaphore_key.clone().unwrap_or_else(|| DEFAULT_SEMAPHORE_KEY.to_string())
-    }
-
-    pub fn is_delete_data(&self) -> bool {
-        self.delete_data.unwrap_or_else(|| false)
-    }
-}
-
-/// SendHeartbeatOptionsBuilder builds SendHeartbeatOptions
-#[derive(Debug, Clone)]
-pub struct SendHeartbeatOptionsBuilder {
-    // The key representing the lock
-    pub key: String,
-
-    // record version of the lock in database. This is what tells the lock client when the lock is stale.
-    pub version: String,
-
-    // The new duration of the lease after the heartbeat is sent
-    pub lease_duration_to_ensure_ms: i64,
-
-    // The delete_data is true if the extra data associated with the lock should be deleted.
-    // Must be null or false if data is non-null.
-    pub delete_data: Option<bool>,
-
-    // Optional link to the semaphore for multiple resource locks
-    pub semaphore_key: Option<String>,
-
-    // The data to be stored alongside the lock (can be empty)
-    // It can be null if no data is needed to be stored there. If null
-    // with replace_data = true, the data will be removed.
-    pub data: Option<String>,
-
-}
-
-impl SendHeartbeatOptionsBuilder {
-    pub fn new(key: &str, version: &str) -> Self {
-        SendHeartbeatOptionsBuilder {
-            key: key.to_string(),
-            version: version.to_string(),
-            lease_duration_to_ensure_ms: DEFAULT_LEASE_PERIOD,
-            delete_data: None,
-            semaphore_key: None,
-            data: None,
-        }
-    }
-
-    pub fn build(&self) -> SendHeartbeatOptions {
-        SendHeartbeatOptions {
-            key: self.key.clone(),
-            version: self.version.clone(),
-            lease_duration_to_ensure_ms: self.lease_duration_to_ensure_ms,
-            delete_data: self.delete_data,
-            semaphore_key: self.semaphore_key.clone(),
-            data: self.data.clone(),
-        }
-    }
-
-    pub fn with_delete_data(&mut self, delete_data: bool) -> &mut Self {
-        self.delete_data = Some(delete_data);
-        self
-    }
-
-    pub fn with_lease_duration_millis(&mut self, val: i64) -> &mut Self {
-        self.lease_duration_to_ensure_ms = val;
-        self
-    }
-
-    pub fn with_lease_duration_secs(&mut self, val: i64) -> &mut Self {
-        self.lease_duration_to_ensure_ms = val * 1000;
-        self
-    }
-
-    pub fn with_lease_duration_minutes(&mut self, val: i64) -> &mut Self {
-        self.lease_duration_to_ensure_ms = val * 1000 * 60;
-        self
-    }
-
-    pub fn with_semaphore_key(&mut self, semaphore_key: &str) -> &mut Self {
-        self.semaphore_key = Some(semaphore_key.to_string());
-        self
-    }
-
-    pub fn with_opt_semaphore_key(&mut self, semaphore_key: &Option<String>) -> &mut Self {
-        self.semaphore_key = semaphore_key.as_ref().map(|k| k.clone());
-        self
-    }
-
-    pub fn with_data(&mut self, data: &str) -> &mut Self {
-        self.data = Some(data.to_string());
-        self
-    }
-
-    pub fn with_opt_data(&mut self, data: &Option<String>) -> &mut Self {
-        self.data = data.as_ref().map(|d| d.clone());
-        self
-    }
-}
-
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum CommandActions {
-    Acquire {
-        /// key of mutex or semaphore to acquire
-        #[arg(short, long)]
-        key: String,
-
-        // How long the lease for the lock is (in seconds)
-        #[arg(short, long, default_value_t = 15)]
-        lease: i64,
-
-        // If this requires a semaphore previously created
-        #[arg(short, long)]
-        semaphore: Option<bool>,
-
-        // The data to be stored alongside the lock (can be empty)
-        #[arg(short, long)]
-        data: Option<String>,
-    },
-    Heartbeat {
-        /// key of mutex to renew lease
-        #[arg(short, long)]
-        key: String,
-
-        // record version of the lock in database. This is what tells the lock client when the lock is stale.
-        #[arg(short, long)]
-        version: String,
-
-        // How long the lease for the lock is (in seconds)
-        #[arg(short, long, default_value_t = 15)]
-        lease: i64,
-
-        // If this requires a semaphore previously created
-        #[arg(short, long)]
-        semaphore_key: Option<String>,
-
-        // The data to be stored alongside the lock (can be empty)
-        #[arg(short, long)]
-        data: Option<String>,
-    },
-    Release {
-        /// key of mutex to release
-        #[arg(short, long)]
-        key: String,
-
-        // record version of the lock in database. This is what tells the lock client when the lock is stale.
-        #[arg(short, long)]
-        version: String,
-
-        // If this requires a semaphore previously created
-        #[arg(short, long)]
-        semaphore_key: Option<String>,
-
-        // The data to be stored alongside the lock (can be empty)
-        #[arg(short, long)]
-        data: Option<String>,
-    },
-    GetMutex {
-        /// key of mutex to retrieve
-        #[arg(short, long)]
-        key: String,
-    },
-    DeleteMutex {
-        /// key of mutex to delete
-        #[arg(short, long)]
-        key: String,
-
-        // record version of the lock in database. This is what tells the lock client when the lock is stale.
-        #[arg(short, long)]
-        version: String,
-
-        // If this requires a semaphore previously created
-        #[arg(short, long)]
-        semaphore_key: Option<String>,
-    },
-    CreateSemaphore {
-        /// key of semaphore to create
-        #[arg(short, long)]
-        key: String,
-
-        // The number of locks in semaphores
-        #[arg(short, long)]
-        max_size: i64,
-
-        // How long the lease for the lock is (in seconds)
-        #[arg(short, long, default_value_t = 15)]
-        lease: i64,
-
-        // The data to be stored alongside the lock (can be empty)
-        #[arg(short, long)]
-        data: Option<String>,
-    },
-    GetSemaphore {
-        /// key of semaphore to retrieve
-        #[arg(short, long)]
-        key: String,
-    },
-    DeleteSemaphore {
-        /// key of semaphore to delete
-        #[arg(short, long)]
-        key: String,
-
-        // record version of the lock in database. This is what tells the lock client when the lock is stale.
-        #[arg(short, long)]
-        version: String,
-    },
-    GetSemaphoreMutexes {
-        /// key of semaphore for retrieving mutexes
-        #[arg(short, long)]
-        key: String,
-    },
-}
-
-/// Database based Mutexes and Semaphores
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-#[command(next_line_help = true)]
-pub struct Args {
-    /// Action to perform
-    #[command(subcommand)]
-    pub action: CommandActions,
-
-    /// Database provider
-    #[arg(value_enum, default_value = "rdb")]
-    pub provider: RepositoryProvider,
-
-    /// tentant-id for the database
-    #[arg(short, long, default_value = "default")]
-    pub tenant: String,
-
-    /// Sets a custom config file
-    #[arg(short, long, value_name = "FILE")]
-    pub config: Option<PathBuf>,
+pub(crate) fn get_default_tenant() -> String {
+    gethostname().to_str().unwrap_or("localhost").to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::options::{AcquireLockOptionsBuilder, ReleaseLockOptionsBuilder, SendHeartbeatOptionsBuilder};
     use super::*;
 
     #[test]
@@ -1425,15 +705,17 @@ mod tests {
             .with_refresh_period_ms(10)
             .with_additional_time_to_wait_for_lock_ms(5)
             .with_override_time_to_wait_for_lock_ms(5)
+            .with_opt_semaphore_max_size(&Some(1))
+            .with_semaphore_max_size(2)
             .build();
         assert_eq!("key1", lock.key);
-        assert_eq!(true, lock.is_reentrant());
-        assert_eq!(true, lock.is_acquire_only_if_already_exists());
+        assert!(lock.is_reentrant());
+        assert!(lock.is_acquire_only_if_already_exists());
         assert_eq!(100000, lock.lease_duration_ms);
         assert_eq!(10, lock.get_refresh_period_ms());
         assert_eq!(5, lock.get_additional_time_to_wait_for_lock_ms());
         assert_eq!(5, lock.get_override_time_to_wait_for_lock_ms());
-        assert_eq!(true, lock.delete_on_release.unwrap());
+        assert!(lock.delete_on_release.unwrap());
         assert_eq!("data1", lock.data.unwrap());
     }
 
@@ -1451,14 +733,30 @@ mod tests {
             .build().to_locked_mutex("tenant_id1");
         let options = lock.to_release_options();
         assert_eq!("key2", options.key);
-        assert_eq!(false, options.is_delete_lock());
+        assert!(!options.is_delete_lock());
         assert_eq!("data2", options.data.unwrap());
+    }
+
+    #[test]
+    fn test_should_build_release_options() {
+        let opts = ReleaseLockOptionsBuilder::new("key", "version")
+            .with_opt_data(&Some("1".to_string()))
+            .with_opt_semaphore_key(&Some("sem".to_string()))
+            .with_semaphore_key("sem1")
+            .with_delete_lock(true)
+            .with_data("data2")
+            .build();
+        assert_eq!("key", opts.key);
+        assert_eq!("sem1", opts.get_semaphore_key());
+        assert!(opts.is_delete_lock());
+        assert_eq!("data2", opts.data.unwrap());
     }
 
     #[test]
     fn test_should_build_heartbeat_options_from_lock_item() {
         let lock = AcquireLockOptionsBuilder::new("key3")
             .with_lease_duration_millis(20)
+            .with_opt_data(&Some("".to_string()))
             .with_data("data3")
             .with_replace_data(true)
             .with_delete_on_release(true)
@@ -1469,33 +767,73 @@ mod tests {
             .build().to_locked_mutex("tenant_id2");
         let options = lock.to_heartbeat_options();
         assert_eq!("key3", options.key);
-        assert_eq!(false, options.is_delete_data());
+        assert!(!options.is_delete_data());
         assert_eq!(20, options.lease_duration_to_ensure_ms);
         assert_eq!("data3", options.data.unwrap());
     }
 
     #[test]
+    fn test_should_build_heartbeat_options() {
+        let opts = SendHeartbeatOptionsBuilder::new("key1", "version1")
+            .with_delete_data(true)
+            .with_lease_duration_millis(0)
+            .with_lease_duration_secs(1)
+            .with_lease_duration_minutes(1)
+            .with_lease_duration_secs(1)
+            .with_opt_semaphore_key(&Some("key".to_string()))
+            .with_semaphore_key("key2")
+            .with_opt_data(&Some("data".to_string()))
+            .with_data("data1").build();
+        assert_eq!("key1", opts.key);
+        assert_eq!("version1", opts.version);
+        assert_eq!("key2", opts.get_semaphore_key());
+    }
+
+
+    #[test]
     fn test_should_build_semaphore() {
         let semaphore = SemaphoreBuilder::new("key5", 200)
             .with_lease_duration_millis(20)
-            .with_data("data1")
             .build();
         assert_eq!("key5", semaphore.semaphore_key);
         assert_eq!(20, semaphore.lease_duration_ms);
         assert_eq!(200, semaphore.max_size);
-        assert_eq!("data1", semaphore.data.unwrap());
     }
 
     #[test]
     fn test_should_serialize_semaphore() {
         let semaphore = SemaphoreBuilder::new("key5", 200)
             .with_lease_duration_millis(20)
-            .with_data("data1")
+            .with_lease_duration_secs(2)
+            .with_lease_duration_minutes(2)
+            .with_fair_semaphore(true)
             .build();
         let s: String = serde_json::to_string(&semaphore).unwrap();
-        assert!(s.as_str().contains("data1"));
+        assert!(s.as_str().contains("key5"));
         let v = serde_json::to_value(&semaphore).unwrap();
-        assert!(v.to_string().as_str().contains("data1"));
+        assert!(v.to_string().as_str().contains("key5"));
+        assert_eq!(semaphore.semaphore_key, semaphore.to_mutex_with_key_version("id", "ver", true).get_semaphore_key());
+        assert!(semaphore.fair_semaphore.unwrap());
+    }
+
+    #[test]
+    fn test_should_create_config() {
+        let config = LocksConfig::new("id");
+        assert_eq!(config.get_tenant_id().as_str(), "id");
+        assert!(config.should_run_database_migrations());
+        assert!(config.is_cache_enabled());
+        assert_eq!("test_db.sqlite", config.get_database_url().as_str());
+        assert_eq!(32, config.get_database_pool_size());
+        assert_eq!(1000, config.get_max_semaphore_size());
+        assert_eq!(DEFAULT_HEARTBEAT_PERIOD, config.get_heartbeat_period_ms());
+        assert_eq!("mutexes", config.get_mutexes_table_name());
+        assert_eq!("redis://127.0.0.1", config.get_redis_url());
+        assert_eq!("semaphores", config.get_semaphores_table_name());
+        assert_eq!("us-west-2", config.get_aws_region());
+        assert!(config.has_ddb_read_consistency());
+        assert_eq!(20, config.get_server_error_retries_limit());
+        assert_eq!(250, config.get_wait_before_server_error_retries_ms());
+        assert_eq!(DEFAULT_HEARTBEAT_PERIOD, None.unwrap_or(DEFAULT_HEARTBEAT_PERIOD));
     }
 }
 

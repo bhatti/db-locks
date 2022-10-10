@@ -6,5 +6,6 @@ extern crate dotenv;
 mod domain;
 mod repository;
 mod manager;
+mod store;
 mod utils;
 

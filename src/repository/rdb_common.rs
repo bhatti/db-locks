@@ -1,13 +1,15 @@
 use std::time::Duration;
+use std::convert::From;
 
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::result::DatabaseErrorKind;
-use diesel_migrations::{FileBasedMigrations, MigrationHarness};
+use diesel_migrations::{FileBasedMigrations, MigrationError, MigrationHarness};
 use r2d2::Error;
+use crate::domain::error::LockError;
 
-use crate::domain::models::{LockError, LocksConfig};
+use crate::domain::models::{LockResult, LocksConfig};
 
 #[derive(Debug)]
 pub struct ConnectionOptions {
@@ -34,18 +36,100 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error> fo
     }
 }
 
-impl std::convert::From<diesel::result::Error> for LockError {
+pub(crate) fn build_pg_pool(config: &LocksConfig) -> Result<Pool<ConnectionManager<PgConnection>>, Error> {
+    log::debug!("building postgres connection pool for {:?}", config);
+
+    let manager = ConnectionManager::<PgConnection>::new(
+        config.get_database_url());
+
+    if config.should_run_database_migrations() {
+        let mut conn = PgConnection::establish(&config.get_database_url()).unwrap();
+        //run_migrations(&mut Conn::new(conn));
+        let _ = run_migrations(&mut conn);
+    }
+
+    Pool::builder()
+        .max_size(config.get_database_pool_size())
+        .test_on_check_out(true)
+        .build(manager)
+}
+
+/*
+fn run_migrations<T: MigrationConnection<'static>>(conn: &mut Conn<T>) -> LockResult<()> {
+    let migrations = FileBasedMigrations::find_migrations_directory()?;
+    match conn.delegate.run_pending_migrations(migrations) {
+        Ok(_) => {}
+        Err(err) => {
+            return Err(LockError::runtime(err.to_string().as_str(), None));
+        }
+    };
+    conn.delegate.begin_test_transaction()?;
+    Ok(())
+}
+*/
+
+fn run_migrations(conn: &mut PgConnection) -> LockResult<()> {
+    let migrations = FileBasedMigrations::find_migrations_directory()?;
+    match conn.run_pending_migrations(migrations) {
+        Ok(_) => {}
+        Err(err) => {
+            return Err(LockError::runtime(err.to_string().as_str(), None));
+        }
+    };
+    conn.begin_test_transaction()?;
+    Ok(())
+}
+
+pub(crate) fn build_sqlite_pool(config: &LocksConfig) -> Result<Pool<ConnectionManager<SqliteConnection>>, Error> {
+    log::debug!("building sqlite connection pool for {:?}", config);
+
+    let manager = ConnectionManager::<SqliteConnection>::new(
+        config.get_database_url());
+
+    if config.should_run_database_migrations() {
+        let mut conn = build_sqlite_connection(&config.get_database_url()).unwrap();
+        let migrations = FileBasedMigrations::find_migrations_directory().unwrap();
+        let _ = conn.run_pending_migrations(migrations).unwrap();
+        conn.begin_test_transaction().unwrap();
+    }
+
+    Pool::builder()
+        .max_size(config.get_database_pool_size())
+        .connection_customizer(Box::new(ConnectionOptions {
+            enable_wal: true,
+            enable_foreign_keys: true,
+            busy_timeout: Some(Duration::from_secs(60)),
+        }))
+        .test_on_check_out(true)
+        .build(manager)
+}
+
+fn build_sqlite_connection(database_url: &str) -> ConnectionResult<SqliteConnection> {
+    SqliteConnection::establish(database_url)
+}
+
+impl From<MigrationError> for LockError {
+    fn from(err: MigrationError) -> Self {
+        LockError::database(
+            format!("rdb database migration error {:?}", err).as_str(), None, false)
+    }
+}
+
+impl From<diesel::result::Error> for LockError {
     fn from(err: diesel::result::Error) -> Self {
         let (retryable, reason) = retryable_db_error(&err);
         if retryable {
             LockError::unavailable(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, true)
+                format!("rdb database error {:?} {:?}", err, reason).as_str(), reason, true)
         } else if Some("NotFound".to_string()) == reason {
             LockError::not_found(
                 format!("not found error {:?} {:?}", err, reason).as_str())
+        } else if Some("UniqueViolation".to_string()) == reason {
+            LockError::duplicate_key(
+                format!("duplicate key error {:?} {:?}", err, reason).as_str())
         } else {
             LockError::database(
-                format!("database error {:?} {:?}", err, reason).as_str(), reason, false)
+                format!("rdb database error {:?} {:?}", err, reason).as_str(), reason, false)
         }
     }
 }
@@ -80,47 +164,3 @@ pub(crate) fn retryable_db_error(err: &diesel::result::Error) -> (bool, Option<S
     }
 }
 
-pub(crate) fn build_pg_pool(config: &LocksConfig) -> Result<Pool<ConnectionManager<PgConnection>>, Error> {
-    log::info!("building postgres connection pool for {:?}", config);
-
-    let manager = ConnectionManager::<PgConnection>::new(config.get_database_url().clone());
-
-    if config.should_run_database_migrations() {
-        let mut conn = PgConnection::establish(&config.get_database_url()).unwrap();
-        let migrations = FileBasedMigrations::find_migrations_directory().unwrap();
-        conn.run_pending_migrations(migrations).unwrap();
-        conn.begin_test_transaction().unwrap();
-    }
-
-    Pool::builder()
-        .max_size(config.get_database_pool_size())
-        .test_on_check_out(true)
-        .build(manager)
-}
-
-pub(crate) fn build_sqlite_pool(config: &LocksConfig) -> Result<Pool<ConnectionManager<SqliteConnection>>, Error> {
-    log::info!("building sqlite connection pool for {:?}", config);
-
-    let manager = ConnectionManager::<SqliteConnection>::new(config.get_database_url().clone());
-
-    if config.should_run_database_migrations() {
-        let mut conn = build_sqlite_connection(&config.get_database_url()).unwrap();
-        let migrations = FileBasedMigrations::find_migrations_directory().unwrap();
-        let _ = conn.run_pending_migrations(migrations).unwrap();
-        conn.begin_test_transaction().unwrap();
-    }
-
-    Pool::builder()
-        .max_size(config.get_database_pool_size())
-        .connection_customizer(Box::new(ConnectionOptions {
-            enable_wal: true,
-            enable_foreign_keys: true,
-            busy_timeout: Some(Duration::from_secs(60)),
-        }))
-        .test_on_check_out(true)
-        .build(manager)
-}
-
-fn build_sqlite_connection(database_url: &String) -> ConnectionResult<SqliteConnection> {
-    SqliteConnection::establish(database_url)
-}

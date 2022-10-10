@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use prometheus::{self, Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder};
 use prometheus::proto::MetricType;
+use crate::domain::error::LockError;
 
-use crate::domain::models::{LockError, LockResult};
+use crate::domain::models::LockResult;
 
 pub(crate) struct LockMetric<'a> {
     metrics: &'a LockMetrics,
@@ -42,6 +43,10 @@ impl<'a> LockMetric<'a> {
             clock: Instant::now(),
         }
     }
+
+    pub fn elapsed(&self) -> Duration {
+        self.clock.elapsed()
+    }
 }
 
 pub(crate) struct LockMetrics {
@@ -65,7 +70,7 @@ impl LockMetrics {
                                                              .buckets(buckets.to_vec()).const_labels(const_labels.clone()), &["method", "status"])?,
             acquire_retry_wait_total: IntCounterVec::new(Opts::new(
                 format!("{}acquire_retry_wait_total", prefix).as_str(), "Total number of lock waits while acquiring")
-                                                             .const_labels(const_labels.clone()), &[])?,
+                                                             .const_labels(const_labels), &[])?,
         };
         match metrics.register(registry) {
             Ok(_) => {}
@@ -109,7 +114,8 @@ impl LockMetrics {
         let mut summary = HashMap::new();
         for metric in prometheus::gather() {
             for m in metric.get_metric() {
-                if m.get_label().len() > 0 && metric.get_field_type() == MetricType::HISTOGRAM {
+                if !m.get_label().is_empty() &&
+                    metric.get_field_type() == MetricType::HISTOGRAM {
                     if metric.get_field_type() == MetricType::HISTOGRAM {
                         summary.insert(
                             format!("{}[{}]_SUM", metric.get_name(), m.get_label()[0].get_value()),
@@ -140,14 +146,14 @@ impl LockMetrics {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread};
+    use std::thread;
     use std::time::Duration;
 
     use env_logger::Env;
     use prometheus::default_registry;
     use rand::Rng;
 
-    use crate::utils::lock_metrics::{LockMetrics};
+    use crate::utils::lock_metrics::LockMetrics;
 
     #[test]
     fn test_should_add_metrics() {
@@ -164,8 +170,11 @@ mod tests {
             metrics2.new_metric("method2");
             thread::sleep(Duration::from_millis(rng.gen_range(5..10)));
         }
+        assert!(metrics1.register(default_registry()).is_err());
         assert_eq!(100, metrics1.get_request_total("method1"));
         assert_eq!(100, metrics2.get_request_total("method2"));
+        assert!(!metrics1.dump().is_empty());
+        assert!(!metrics1.summary().is_empty());
     }
 }
 
