@@ -352,15 +352,6 @@ impl FairSemaphoreRepository for RetryableFairSemaphoreRepository {
         }).await
     }
 
-    async fn find_by_tenant_id(&self,
-                               other_tenant_id: &str,
-                               page: Option<&str>,
-                               page_size: usize) -> LockResult<PaginatedResult<Semaphore>> {
-        invoke_with_retry_attempts(&self.config, "find_by_tenant_id", || async {
-            self.delegate.find_by_tenant_id(other_tenant_id, page, page_size).await
-        }).await
-    }
-
     async fn acquire_update(&self, semaphore: &Semaphore) -> LockResult<MutexLock> {
         invoke_with_retry_attempts(&self.config, "acquire_update", || async {
             self.delegate.acquire_update(semaphore).await
@@ -386,6 +377,15 @@ impl FairSemaphoreRepository for RetryableFairSemaphoreRepository {
     async fn get_semaphore_mutexes(&self, other_key: &str, other_tenant_id: &str) -> LockResult<Vec<MutexLock>> {
         invoke_with_retry_attempts(&self.config, "get_semaphore_mutexes", || async {
             self.delegate.get_semaphore_mutexes(other_key, other_tenant_id).await
+        }).await
+    }
+
+    async fn find_by_tenant_id(&self,
+                               other_tenant_id: &str,
+                               page: Option<&str>,
+                               page_size: usize) -> LockResult<PaginatedResult<Semaphore>> {
+        invoke_with_retry_attempts(&self.config, "find_by_tenant_id", || async {
+            self.delegate.find_by_tenant_id(other_tenant_id, page, page_size).await
         }).await
     }
 

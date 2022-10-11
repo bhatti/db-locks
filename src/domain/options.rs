@@ -11,7 +11,7 @@ use crate::domain::models::{DEFAULT_LEASE_PERIOD, DEFAULT_SEMAPHORE_KEY, MutexLo
 
 // Used as a default buffer for how long extra to wait when querying database for a
 // lock in acquireLock (can be overridden by specifying a timeout when calling acquireLock)
-const DEFAULT_BUFFER_MS: i64 = 200;
+const DEFAULT_BUFFER_MS: i64 = 500;
 
 /// AcquireLockOptions defines abstraction for acquiring lock
 #[derive(Debug, Clone, Serialize, Deserialize, Eq)]
@@ -121,8 +121,7 @@ impl AcquireLockOptions {
     }
 
     pub fn is_acquire_only_if_already_exists(&self) -> bool {
-        self.semaphore_max_size.unwrap_or(0) > 1 ||
-            self.acquire_only_if_already_exists.unwrap_or(false)
+        self.acquire_only_if_already_exists.unwrap_or(false)
     }
 
     pub fn get_additional_time_to_wait_for_lock_ms(&self) -> i64 {

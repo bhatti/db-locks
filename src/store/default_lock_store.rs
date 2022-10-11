@@ -41,7 +41,7 @@ impl DefaultLockStore {
                 Some(saving)
             }
             Err(err) => {
-                log::warn!("update_lock:: failed to update lock for {} due to {}", saving.mutex_key, err);
+                log::warn!("update_lock:: failed to update mutex lock for {} due to {}", saving.mutex_key, err);
                 None
             }
         }
@@ -62,6 +62,17 @@ impl DefaultLockStore {
         }
     }
 
+    // update data for release
+    async fn release_update(&self, opts: &ReleaseLockOptions, data: Option<String>) -> LockResult<()> {
+        // will check for version mismatch
+        let _ = self.mutex_repository.release_update(
+            opts.key.as_str(),
+            self.tenant_id.as_str(),
+            opts.version.as_str(),
+            data.as_deref()).await?;
+        Ok(())
+    }
+
     // find regular mutexes or semaphore locks
     async fn get_all_mutexes_by_key(&self, key: &str, semaphore_max_size: i32) -> Vec<MutexLock> {
         if semaphore_max_size > 1 {
@@ -77,23 +88,14 @@ impl DefaultLockStore {
 
     async fn populate_semaphore_busy_count(&self, semaphore: &mut Semaphore) -> LockResult<()> {
         let mut busy_count = 0;
-        for m in self.get_semaphore_mutexes(semaphore.semaphore_key.as_str()).await? {
+        for m in self.get_cached_or_db_semaphore_mutexes(
+            semaphore.semaphore_key.as_str(), semaphore.max_size).await? {
             if !m.expired() {
                 busy_count += 1;
             }
         }
         semaphore.busy_count = Some(busy_count);
-        Ok(())
-    }
-
-    // update data for release
-    async fn release_update(&self, opts: &ReleaseLockOptions, data: Option<String>) -> LockResult<()> {
-        // will check for version mismatch
-        let _ = self.mutex_repository.release_update(
-            opts.key.as_str(),
-            self.tenant_id.as_str(),
-            opts.version.as_str(),
-            data.as_deref()).await?;
+        semaphore.fair_semaphore = Some(false);
         Ok(())
     }
 
@@ -171,7 +173,6 @@ impl DefaultLockStore {
         self.mutex_repository.find_by_semaphore(
             semaphore_key, self.tenant_id.as_str(), page, page_size).await
     }
-
 }
 
 #[async_trait]
@@ -301,11 +302,11 @@ impl LockStore for DefaultLockStore {
         match self.cache.get_cached_semaphore(semaphore_key) {
             None => {
                 let mut semaphore = self.fetch_db_semaphore(semaphore_key).await?;
-                let _ = self.populate_semaphore_busy_count(&mut semaphore);
+                let _ = self.populate_semaphore_busy_count(&mut semaphore).await;
                 Ok(semaphore)
             }
             Some(mut semaphore) => {
-                let _ = self.populate_semaphore_busy_count(&mut semaphore);
+                let _ = self.populate_semaphore_busy_count(&mut semaphore).await;
                 Ok(semaphore)
             }
         }
@@ -332,12 +333,6 @@ impl LockStore for DefaultLockStore {
 
     // Creates or updates semaphore with given max size
     async fn create_semaphore(&self, semaphore: &Semaphore) -> LockResult<usize> {
-        if let Ok(lock) = self.get_mutex(semaphore.semaphore_key.as_str()).await {
-            return Err(LockError::validation(
-                format!("cannot create semaphore for {} as lock with the key already exists {}",
-                        semaphore.semaphore_key.clone(), lock).as_str(), None));
-        }
-
         match self.get_semaphore(&semaphore.semaphore_key).await {
             Ok(old) => {
                 let saving = old.clone_with_tenant_id(semaphore, self.tenant_id.as_str());

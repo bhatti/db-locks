@@ -70,7 +70,6 @@ async fn main() {
     };
 
     let locks_manager = LockManagerImpl::new(
-        args.provider,
         &config,
         store,
         &default_registry())
@@ -86,7 +85,11 @@ async fn main() {
 
             let mutex = locks_manager.acquire_lock(&opts).await
                 .expect("failed to acquire lock");
-            log::info!("acquired lock {}", mutex);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&mutex).unwrap());
+            } else {
+                log::info!("acquired lock {}", mutex);
+            }
         }
         CommandActions::Heartbeat { key, version, lease, semaphore_key, data } => {
             let opts = SendHeartbeatOptionsBuilder::new(key, version)
@@ -97,7 +100,11 @@ async fn main() {
 
             let mutex = locks_manager.send_heartbeat(&opts).await
                 .expect("failed to renew lock");
-            log::info!("renewed lock {}", mutex);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&mutex).unwrap());
+            } else {
+                log::info!("renewed lock {}", mutex);
+            }
         }
         CommandActions::Release { key, version, semaphore_key, data } => {
             let opts = ReleaseLockOptionsBuilder::new(key, version)
@@ -107,12 +114,20 @@ async fn main() {
 
             let done = locks_manager.release_lock(&opts).await
                 .expect("failed to release lock");
-            log::info!("released lock {}", done);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&done).unwrap());
+            } else {
+                log::info!("released lock {}", done);
+            }
         }
         CommandActions::GetMutex { key } => {
             let mutex = locks_manager.get_mutex(key.as_str()).await
                 .expect("failed to find lock");
-            log::info!("found lock {}", mutex);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&mutex).unwrap());
+            } else {
+                log::info!("found lock {}", mutex);
+            }
         }
         CommandActions::CreateMutex{ key, lease, data } => {
             let mutex = AcquireLockOptionsBuilder::new(key.as_str())
@@ -121,13 +136,21 @@ async fn main() {
                 .build().to_unlocked_mutex(config.get_tenant_id().as_str());
             let size = locks_manager.create_mutex(&mutex).await
                 .expect("failed to create mutex");
-            log::info!("created mutex {}", size);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&mutex).unwrap());
+            } else {
+                log::info!("created mutex {}", size);
+            }
         }
         CommandActions::DeleteMutex { key, version, semaphore_key } => {
             let size = locks_manager.delete_mutex(
                 key.as_str(), version.as_str(), semaphore_key.as_ref().map(|s| s.clone())).await
                 .expect("failed to delete lock");
-            log::info!("deleted lock {}", size);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&size).unwrap());
+            } else {
+                log::info!("deleted lock {}", size);
+            }
         }
         CommandActions::CreateSemaphore { key, max_size, lease} => {
             let semaphore = SemaphoreBuilder::new(key.as_str(), *max_size as i32)
@@ -135,24 +158,40 @@ async fn main() {
                 .build();
             let size = locks_manager.create_semaphore(&semaphore).await
                 .expect("failed to create semaphore");
-            log::info!("created semaphore {}", size);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&semaphore).unwrap());
+            } else {
+                log::info!("created semaphore {}", size);
+            }
         }
         CommandActions::GetSemaphore { key } => {
             let semaphore = locks_manager.get_semaphore(key.as_str()).await
                 .expect("failed to find semaphore");
-            log::info!("found semaphore {}", semaphore);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&semaphore).unwrap());
+            } else {
+                log::info!("found semaphore {}", semaphore);
+            }
         }
         CommandActions::DeleteSemaphore { key, version } => {
             let size = locks_manager.delete_semaphore(key.as_str(), version.as_str()).await
                 .expect("failed to delete semaphore");
-            log::info!("deleted semaphore {}", size);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&size).unwrap());
+            } else {
+                log::info!("deleted semaphore {}", size);
+            }
         }
         CommandActions::GetSemaphoreMutexes { key } => {
             let mutexes = locks_manager.get_semaphore_mutexes(key.as_str()).await
                 .expect("failed to find semaphore mutexes");
-            log::info!("found {} semaphore mutexes:", mutexes.len());
-            for mutex in mutexes {
-                log::info!("\t{}", mutex);
+            if args.json_output.unwrap_or(false) {
+                println!("{}", serde_json::to_string(&mutexes).unwrap());
+            } else {
+                log::info!("found {} semaphore mutexes:", mutexes.len());
+                for mutex in mutexes {
+                    log::info!("\t{}", mutex);
+                }
             }
         }
     }

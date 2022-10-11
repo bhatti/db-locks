@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-//use clap::clap_derive::{parser as Parser, subcommand as Subcommand};
 use std::path::PathBuf;
 use crate::domain::models::RepositoryProvider;
 
@@ -145,6 +144,10 @@ pub struct Args {
     /// fair semaphore lock
     #[arg(short, long, default_value = "false")]
     pub fair_semaphore: Option<bool>,
+
+    /// json output of result from action
+    #[arg(short, long, default_value = "false")]
+    pub json_output: Option<bool>,
 
     /// Sets a custom config file
     #[arg(short, long, value_name = "FILE")]

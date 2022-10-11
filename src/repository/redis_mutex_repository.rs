@@ -5,6 +5,8 @@ use crate::domain::error::LockError;
 use crate::domain::models::{LockResult, LocksConfig, MutexLock, PaginatedResult, SemaphoreBuilder};
 use crate::repository::{MutexRepository, redis_common};
 
+const LOCK_PREFIX: &str = "lock_";
+
 #[derive(Clone)]
 pub(crate) struct RedisMutexRepository {
     client: Client,
@@ -28,7 +30,7 @@ impl RedisMutexRepository {
     // update lock item
     fn update_with_lock_expiration(&self, mutex: &MutexLock) -> LockResult<usize> {
         let mut conn = self.client.get_connection()?;
-        let lock_name = mutex.full_key();
+        let lock_name = mutex.full_key(LOCK_PREFIX);
         let size: usize = redis_common::update_atomic_lock_expiration(
             &mut conn,
             lock_name.as_str(),
@@ -97,7 +99,7 @@ impl MutexRepository for RedisMutexRepository {
                             old_version: &str,
                             mutex: &MutexLock) -> LockResult<usize> {
         let mut conn = self.client.get_connection()?;
-        let lock_name = mutex.full_key();
+        let lock_name = mutex.full_key(LOCK_PREFIX);
         let size = redis_common::acquire_atomic_lock(
             &mut conn, lock_name.as_str(), old_version, mutex.version.as_str())?;
         if size == 0 {
@@ -111,7 +113,7 @@ impl MutexRepository for RedisMutexRepository {
                               old_version: &str,
                               mutex: &MutexLock) -> LockResult<usize> {
         let mut conn = self.client.get_connection()?;
-        let lock_name = mutex.full_key();
+        let lock_name = mutex.full_key(LOCK_PREFIX);
         let size = redis_common::refresh_atomic_lock_expiration(
             &mut conn,
             lock_name.as_str(),
@@ -138,8 +140,7 @@ impl MutexRepository for RedisMutexRepository {
 
         let mut conn = self.client.get_connection()?;
         let lock_name = MutexLock::build_full_key(
-            other_key,
-            other_tenant_id);
+            LOCK_PREFIX, other_key, other_tenant_id);
         let size = redis_common::delete_atomic_lock(
             &mut conn, lock_name.as_str(), other_version)?;
         if size == 0 {
@@ -182,8 +183,7 @@ impl MutexRepository for RedisMutexRepository {
         }
 
         let lock_name = MutexLock::build_full_key(
-            other_key,
-            other_tenant_id);
+            LOCK_PREFIX, other_key, other_tenant_id);
 
         let mut conn = self.client.get_connection()?;
         let size = redis_common::delete_atomic_lock(
@@ -202,8 +202,7 @@ impl MutexRepository for RedisMutexRepository {
 
     async fn delete_expired_lock(&self, other_key: &str, other_tenant_id: &str) -> LockResult<usize> {
         let lock_name = MutexLock::build_full_key(
-            other_key,
-            other_tenant_id);
+            LOCK_PREFIX, other_key, other_tenant_id);
         let mut conn = self.client.get_connection()?;
         let size: usize = redis_common::delete_atomic_lock(
             &mut conn,

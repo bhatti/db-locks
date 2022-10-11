@@ -33,7 +33,7 @@ impl FairLockStore {
                 Some(saving)
             }
             Err(err) => {
-                log::debug!("update_lock:: failed to update lock for {:?} due to {}", opts, err);
+                log::debug!("update_lock:: failed to update fair semaphore lock for {:?} due to {}", opts, err);
                 None
             }
         }
@@ -87,7 +87,7 @@ impl LockStore for FairLockStore {
 
     async fn try_send_heartbeat(&self, opts: &SendHeartbeatOptions) -> LockResult<MutexLock> {
         self.heartbeat_update(
-            opts.key.as_str(),
+            opts.get_semaphore_key().as_str(),
             opts.version.as_str(),
             opts.lease_duration_to_ensure_ms)
             .await.map(|_| opts.to_mutex(self.tenant_id.as_str(), true))

@@ -7,6 +7,8 @@ use crate::domain::models::{LockResult, MutexLock, PaginatedResult, Semaphore};
 use crate::repository::{FairSemaphoreRepository, redis_common, SemaphoreRepository};
 use crate::repository::redis_semaphore_repository::RedisSemaphoreRepository;
 
+const FAIR_LOCK_PREFIX: &str = "fair_lock_";
+
 pub(crate) struct RedisFairSemaphoreRepository {
     client: Client,
     semaphore_repository: RedisSemaphoreRepository,
@@ -51,7 +53,7 @@ impl RedisFairSemaphoreRepository {
     ) -> LockResult<Vec<String>> {
         let mut conn = self.client.get_connection()?;
         let lock_name = MutexLock::build_full_key(
-            other_key, other_tenant_id);
+            FAIR_LOCK_PREFIX, other_key, other_tenant_id);
         redis_common::semaphore_busy_identifiers(&mut conn, lock_name.as_str())
     }
 
@@ -62,7 +64,7 @@ impl RedisFairSemaphoreRepository {
     ) -> LockResult<usize> {
         let mut conn = self.client.get_connection()?;
         let lock_name = MutexLock::build_full_key(
-            other_key, other_tenant_id);
+            FAIR_LOCK_PREFIX, other_key, other_tenant_id);
         let _ = redis_common::delete_semaphore(&mut conn, lock_name.as_str())?;
         self.semaphore_repository.delete_semaphore(&mut conn, other_key, other_tenant_id, other_version)
     }
@@ -88,7 +90,7 @@ impl FairSemaphoreRepository for RedisFairSemaphoreRepository {
 
     async fn acquire_update(&self, semaphore: &Semaphore) -> LockResult<MutexLock> {
         let mut conn = self.client.get_connection()?;
-        let lock_name = semaphore.full_key();
+        let lock_name = semaphore.full_key(FAIR_LOCK_PREFIX);
         let id = Uuid::new_v4().to_string();
 
         let size = redis_common::acquire_semaphore(
@@ -100,7 +102,8 @@ impl FairSemaphoreRepository for RedisFairSemaphoreRepository {
         let mut semaphore = semaphore.clone_with_tenant_id(semaphore, semaphore.tenant_id.as_str());
         semaphore.fair_semaphore = Some(true);
         let _ = self.semaphore_repository.save_semaphore(&mut conn, &semaphore)?;
-        Ok(semaphore.to_mutex_with_key_version(semaphore.semaphore_key.as_str(), id.as_str(), true))
+        let mutex_key = format!("{}_{}", semaphore.semaphore_key, id);
+        Ok(semaphore.to_mutex_with_key_version(mutex_key.as_str(), id.as_str(), true))
     }
 
     async fn heartbeat_update(&self,
@@ -110,7 +113,7 @@ impl FairSemaphoreRepository for RedisFairSemaphoreRepository {
                               lease_duration_ms: i64) -> LockResult<usize> {
         let mut conn = self.client.get_connection()?;
         let lock_name = MutexLock::build_full_key(
-            other_key, other_tenant_id);
+            FAIR_LOCK_PREFIX, other_key, other_tenant_id);
         let size = redis_common::refresh_semaphore(
             &mut conn,
             lock_name.as_str(),
@@ -129,7 +132,7 @@ impl FairSemaphoreRepository for RedisFairSemaphoreRepository {
                             _other_data: Option<&str>) -> LockResult<usize> {
         let mut conn = self.client.get_connection()?;
         let lock_name = MutexLock::build_full_key(
-            other_key, other_tenant_id);
+            FAIR_LOCK_PREFIX, other_key, other_tenant_id);
         let size = redis_common::release_semaphore(
             &mut conn,
             lock_name.as_str(),
@@ -149,9 +152,9 @@ impl FairSemaphoreRepository for RedisFairSemaphoreRepository {
         let ids = self.busy_identifiers(
             semaphore.semaphore_key.as_str(), semaphore.tenant_id.as_str()).unwrap();
         let mut mutexes = vec![];
-        for (i, id) in ids.iter().enumerate() {
-            let key = Semaphore::build_key_rank(other_key, i as i32);
-            let mutex = semaphore.to_mutex_with_key_version(key.as_str(), id, true);
+        for (_i, id) in ids.iter().enumerate() {
+            let mutex_key = format!("{}_{}", other_key, id);
+            let mutex = semaphore.to_mutex_with_key_version(mutex_key.as_str(), id, true);
             mutexes.push(mutex);
         }
         for i in mutexes.len()..semaphore.max_size as usize {

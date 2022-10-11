@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use prometheus::Registry;
 use crate::domain::error::LockError;
 
-use crate::domain::models::{LockResult, LocksConfig, MutexLock, RepositoryProvider, Semaphore};
+use crate::domain::models::{LockResult, LocksConfig, MutexLock, Semaphore};
 use crate::domain::options::{AcquireLockOptions, ReleaseLockOptions, SendHeartbeatOptions};
 use crate::manager::LockManager;
 use crate::store::LockStore;
@@ -17,18 +17,15 @@ pub struct LockManagerImpl {
     max_semaphore_mutexes: i32,
     store: Box<dyn LockStore + Send + Sync>,
     metrics: LockMetrics,
-    provider: RepositoryProvider,
     config: LocksConfig,
 }
 
 impl LockManagerImpl {
     pub fn new(
-        provider: RepositoryProvider,
         config: &LocksConfig,
         store: Box<dyn LockStore + Send + Sync>,
         registry: &Registry) -> LockResult<Self> {
         Ok(LockManagerImpl {
-            provider,
             config: config.clone(),
             max_semaphore_mutexes: config.get_max_semaphore_size(),
             store,
@@ -39,8 +36,8 @@ impl LockManagerImpl {
 
 impl Display for LockManagerImpl {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "LockManager provider={} fair-semaphore={} tenant_id={} metrics={:?}",
-               self.provider, self.config.is_fair_semaphore(), self.config.get_tenant_id(), self.metrics.summary())
+        write!(f, "LockManager fair-semaphore={} tenant_id={} metrics={:?}",
+               self.config.is_fair_semaphore(), self.config.get_tenant_id(), self.metrics.summary())
     }
 }
 
@@ -551,7 +548,6 @@ mod tests {
                 match store.ping().await {
                     Ok(_) => {
                         managers.push(LockManagerImpl::new(
-                            provider,
                             &config,
                             store,
                             default_registry(),

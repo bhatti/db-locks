@@ -17,9 +17,9 @@ use crate::domain::options::{AcquireLockOptions, ReleaseLockOptions, SendHeartbe
 use crate::domain::schema::*;
 use crate::utils;
 
-const DEFAULT_HEARTBEAT_PERIOD: i64 = 5000;
-
 pub(crate) const DEFAULT_LEASE_PERIOD: i64 = 15000;
+
+const DEFAULT_HEARTBEAT_PERIOD: i64 = 5000;
 
 pub(crate) const DEFAULT_SEMAPHORE_KEY: &str = "DEFAULT";
 
@@ -302,12 +302,12 @@ impl MutexLock {
             self.data.clone())
     }
 
-    pub fn full_key(&self) -> String {
-        MutexLock::build_full_key(self.mutex_key.as_str(), self.tenant_id.as_str())
+    pub fn full_key(&self, prefix: &str) -> String {
+        MutexLock::build_full_key(prefix, self.mutex_key.as_str(), self.tenant_id.as_str())
     }
 
-    pub fn build_full_key(other_key: &str, other_tenant_key: &str) -> String {
-        format!("{}_{}", other_key, other_tenant_key)
+    pub fn build_full_key(prefix: &str, other_key: &str, other_tenant_key: &str) -> String {
+        format!("{}{}_{}", prefix, other_key, other_tenant_key)
     }
 
     pub fn expires_at_string(&self) -> String {
@@ -432,8 +432,8 @@ impl Semaphore {
         self.fair_semaphore.unwrap_or(false)
     }
 
-    pub fn full_key(&self) -> String {
-        MutexLock::build_full_key(self.semaphore_key.as_str(), self.tenant_id.as_str())
+    pub fn full_key(&self, prefix: &str) -> String {
+        MutexLock::build_full_key(prefix, self.semaphore_key.as_str(), self.tenant_id.as_str())
     }
 }
 
@@ -836,5 +836,4 @@ mod tests {
         assert_eq!(DEFAULT_HEARTBEAT_PERIOD, None.unwrap_or(DEFAULT_HEARTBEAT_PERIOD));
     }
 }
-
 

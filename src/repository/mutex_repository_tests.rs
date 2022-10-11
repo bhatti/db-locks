@@ -43,7 +43,7 @@ mod tests {
                     // THEN it should fail
                     assert!(mutex_repo.create(&mutex).await.is_err());
 
-                    let old_version = versions.get(&mutex.full_key()).unwrap().clone();
+                    let old_version = versions.get(&mutex.full_key("test")).unwrap().clone();
                     // WHEN acquiring lock with existing key and tenant-id
                     // THEN it should succeed
                     mutex_repo.acquire_update(old_version.as_str(), &mutex).await
@@ -54,7 +54,7 @@ mod tests {
                 // THEN it should succeed
                 assert_eq!(mutex, mutex_repo.get(mutex.mutex_key.as_str(), mutex.tenant_id.as_str()).await.unwrap());
 
-                versions.insert(mutex.full_key(), mutex.version);
+                versions.insert(mutex.full_key("test"), mutex.version);
             }
 
             // Note: Though we are writing 5 times but unique keys are only mutex_key and tenant_id so we will only
@@ -93,13 +93,13 @@ mod tests {
                     // THEN it should fail
                     assert!(mutex_repo.create(&lock).await.is_err());
 
-                    let old_version = versions.get(&lock.full_key()).unwrap().clone();
+                    let old_version = versions.get(&lock.full_key("test")).unwrap().clone();
                     // WHEN acquiring lock with existing key and tenant-id
                     // THEN it should succeed
                     mutex_repo.acquire_update(old_version.as_str(), &lock).await
                         .expect("should acquire lock");
                 }
-                versions.insert(lock.full_key(), lock.version);
+                versions.insert(lock.full_key("test"), lock.version);
             }
 
             // WHEN finding lock with existing key and tenant-id
