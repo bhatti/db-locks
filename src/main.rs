@@ -1,15 +1,17 @@
 extern crate diesel;
 extern crate diesel_migrations;
 extern crate dotenv;
+#[macro_use]
+extern crate lazy_static;
 
 use std::fs;
 
 use clap::Parser;
 use env_logger::Env;
 use prometheus::default_registry;
-use domain::options::{AcquireLockOptionsBuilder, ReleaseLockOptionsBuilder, SendHeartbeatOptionsBuilder};
 
 use domain::args::{Args, CommandActions};
+use domain::options::{AcquireLockOptionsBuilder, ReleaseLockOptionsBuilder, SendHeartbeatOptionsBuilder};
 
 use crate::domain::models::{LocksConfig, RepositoryProvider, SemaphoreBuilder};
 use crate::manager::lock_manager::LockManagerImpl;

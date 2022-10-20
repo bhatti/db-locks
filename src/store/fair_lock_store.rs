@@ -54,7 +54,7 @@ impl FairLockStore {
     async fn release_update(&self, opts: &ReleaseLockOptions) -> LockResult<()> {
         // will not check for version mismatch
         let _ = self.fair_semaphore_repository.release_update(
-            opts.key.as_str(),
+            opts.get_semaphore_key().as_str(),
             self.tenant_id.as_str(),
             opts.version.as_str(),
             opts.data.as_deref()).await?;

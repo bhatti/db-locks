@@ -255,7 +255,13 @@ mod tests {
             assert!(lock_manager.release_lock(&lock.to_release_options()).await.unwrap());
 
             // AND we should be able to lock it again
-            assert_eq!(lock, lock_manager.acquire_lock(&lock_options).await.expect("should acquire lock again"));
+            if lock_manager.config.is_fair_semaphore() {
+                assert_eq!(lock.semaphore_key, lock_manager.acquire_lock(
+                    &lock_options).await.expect("should acquire lock again").semaphore_key);
+            } else {
+                assert_eq!(lock, lock_manager.acquire_lock(
+                    &lock_options).await.expect("should acquire lock again"));
+            }
         }
     }
 
@@ -271,13 +277,21 @@ mod tests {
                 .build();
 
             // WHEN acquiring a non-existing lock
-            let lock = lock_manager.acquire_lock(&lock_options).await.expect("should acquire lock");
+            let lock = lock_manager.acquire_lock(&lock_options)
+                .await.expect("should acquire lock");
             // THEN it should succeed
             assert_eq!(Some(true), lock.locked);
 
             // WHEN trying to lock it again with reentrant flag
             lock_options.reentrant = Some(true);
-            assert_eq!(lock, lock_manager.acquire_lock(&lock_options).await.expect("should acquire lock again"));
+            if lock_manager.config.is_fair_semaphore() {
+                assert_eq!(lock.semaphore_key, lock_manager.acquire_lock(&lock_options)
+                    .await.expect("should acquire lock again").semaphore_key);
+
+            } else {
+                assert_eq!(lock, lock_manager.acquire_lock(&lock_options)
+                    .await.expect("should acquire lock again"));
+            }
         }
     }
 

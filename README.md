@@ -164,7 +164,7 @@ cargo run --
 ```
 This will show following command line options
 ```shell
-Database based Mutexes and Semaphores
+Mutexes and Semaphores based Distributed Locks with databases
 
 Usage: db-locks [OPTIONS] [PROVIDER] <COMMAND>
 
@@ -201,6 +201,8 @@ Options:
           tentant-id for the database [default: local-host-name]
   -f, --fair-semaphore <FAIR_SEMAPHORE>
           fair semaphore lock [default: false] [possible values: true, false]
+  -j, --json-output <JSON_OUTPUT>
+          json output of result from action [default: false] [possible values: true, false]
   -c, --config <FILE>
           Sets a custom config file
   -h, --help

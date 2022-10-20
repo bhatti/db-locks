@@ -214,7 +214,7 @@ mod tests {
         assert!(fair_semaphore_repo.acquire_update(&semaphore).await.is_err());
         for mutex in &mutexes {
             let size = fair_semaphore_repo.heartbeat_update(
-                mutex.mutex_key.as_str(),
+                mutex.get_semaphore_key().as_str(),
                 mutex.tenant_id.as_str(),
                 mutex.version.as_str(),
                 mutex.lease_duration_ms)

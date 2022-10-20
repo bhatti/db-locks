@@ -124,7 +124,7 @@ pub enum CommandActions {
     },
 }
 
-/// Database based Mutexes and Semaphores
+/// Mutexes and Semaphores based Distributed Locks with databases.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 #[command(next_line_help = true)]
